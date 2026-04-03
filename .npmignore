@@ -1,0 +1,15 @@
+src/
+examples/
+docs/
+in.txt
+*.test.ts
+__tests__/
+vitest.config.ts
+tsup.config.ts
+tsconfig.json
+.gitignore
+.DS_Store
+coverage/
+agent-session.json
+.env
+.env.*

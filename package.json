@@ -1,0 +1,64 @@
+{
+  "name": "@sschepis/oboto-agent",
+  "version": "0.1.0",
+  "description": "Event-driven dual-LLM orchestration library for autonomous AI agents",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sschepis/oboto-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sschepis/oboto-agent/issues"
+  },
+  "homepage": "https://github.com/sschepis/oboto-agent#readme",
+  "keywords": [
+    "ai",
+    "agent",
+    "llm",
+    "orchestration",
+    "dual-llm",
+    "event-driven",
+    "tool-calling",
+    "typescript"
+  ],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "peerDependencies": {
+    "@sschepis/lmscript": "^0.1.0",
+    "@sschepis/swiss-army-tool": "^0.1.0",
+    "@sschepis/as-agent": "^0.1.0"
+  },
+  "optionalDependencies": {
+    "@aleph-ai/tinyaleph": "^1.7.0",
+    "@sschepis/resolang": "^0.5.0"
+  },
+  "devDependencies": {
+    "@sschepis/lmscript": "file:../lmscript",
+    "@sschepis/swiss-army-tool": "file:../swiss-army-tool",
+    "@sschepis/as-agent": "file:../claw-code/assembly",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "license": "MIT",
+  "author": "Sebastian Schepis"
+}
