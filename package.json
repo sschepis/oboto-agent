@@ -1,6 +1,6 @@
 {
   "name": "@sschepis/oboto-agent",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Event-driven dual-LLM orchestration library for autonomous AI agents",
   "type": "module",
   "main": "./dist/index.js",
@@ -43,6 +43,7 @@
     "zod": "^3.23.0"
   },
   "peerDependencies": {
+    "@sschepis/llm-wrapper": "^0.1.0",
     "@sschepis/lmscript": "^0.1.0",
     "@sschepis/swiss-army-tool": "^0.1.0",
     "@sschepis/as-agent": "^0.1.0"
@@ -52,6 +53,7 @@
     "@sschepis/resolang": "^0.5.0"
   },
   "devDependencies": {
+    "@sschepis/llm-wrapper": "file:../llm-wrapper",
     "@sschepis/lmscript": "file:../lmscript",
     "@sschepis/swiss-army-tool": "file:../swiss-army-tool",
     "@sschepis/as-agent": "file:../claw-code/assembly",

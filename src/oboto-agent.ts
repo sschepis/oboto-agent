@@ -1,35 +1,29 @@
-import { z } from "zod";
-import {
-  LScriptRuntime,
-  AgentLoop,
-  type LScriptFunction,
-  type ToolDefinition,
-  type ChatMessage,
-  type ToolCall,
-} from "@sschepis/lmscript";
+import { LScriptRuntime, type ToolDefinition, type ChatMessage } from "@sschepis/lmscript";
+import type {
+  BaseProvider,
+  StandardChatParams,
+  Message as WrapperMessage,
+  ToolDefinition as WrapperToolDef,
+  StandardChatResponse,
+} from "@sschepis/llm-wrapper";
 import type { Session, ConversationMessage } from "@sschepis/as-agent";
 import { MessageRole } from "@sschepis/as-agent";
 import type { ObotoAgentConfig, AgentEventType, AgentEvent, TriageResult } from "./types.js";
 import { AgentEventBus } from "./event-bus.js";
 import { ContextManager } from "./context-manager.js";
-import { createTriageFunction, type TriageInput } from "./triage.js";
+import { createTriageFunction } from "./triage.js";
 import { createRouterTool } from "./adapters/tools.js";
-import { toChat, fromChat, createEmptySession } from "./adapters/memory.js";
+import { toLmscriptProvider } from "./adapters/llm-wrapper.js";
+import { toChat, createEmptySession } from "./adapters/memory.js";
 
 type EventHandler = (event: AgentEvent) => void;
-
-/** Free-form response schema for the main agent loop. */
-const AgentResponseSchema = z.object({
-  response: z.string().describe("The agent's response to the user"),
-});
-
-type AgentInput = { userInput: string; context: string };
 
 /**
  * ObotoAgent is the central orchestrator for dual-LLM agent execution.
  *
  * It binds together:
- * - lmscript (LLM I/O via local and remote providers)
+ * - llm-wrapper (LLM communication via local and remote providers)
+ * - lmscript (structured/schema-validated calls for triage)
  * - swiss-army-tool (tool execution via Router)
  * - as-agent (session state and conversation history)
  *
@@ -38,7 +32,8 @@ type AgentInput = { userInput: string; context: string };
 export class ObotoAgent {
   private bus = new AgentEventBus();
   private localRuntime: LScriptRuntime;
-  private remoteRuntime: LScriptRuntime;
+  private localProvider: BaseProvider;
+  private remoteProvider: BaseProvider;
   private contextManager: ContextManager;
   private routerTool: ToolDefinition<any, any>;
   private triageFn: ReturnType<typeof createTriageFunction>;
@@ -51,8 +46,13 @@ export class ObotoAgent {
 
   constructor(config: ObotoAgentConfig) {
     this.config = config;
-    this.localRuntime = new LScriptRuntime({ provider: config.localModel });
-    this.remoteRuntime = new LScriptRuntime({ provider: config.remoteModel });
+    this.localProvider = config.localModel;
+    this.remoteProvider = config.remoteModel;
+
+    // Wrap llm-wrapper providers into lmscript LLMProvider for structured calls (triage)
+    const localLmscript = toLmscriptProvider(config.localModel, "local");
+    this.localRuntime = new LScriptRuntime({ provider: localLmscript });
+
     this.session = config.session ?? createEmptySession();
     this.systemPrompt = config.systemPrompt ?? "You are a helpful AI assistant with access to tools.";
     this.maxIterations = config.maxIterations ?? 10;
@@ -155,7 +155,7 @@ export class ObotoAgent {
     await this.contextManager.push(toChat(userMsg));
     this.bus.emit("state_updated", { reason: "user_input" });
 
-    // 2. Triage via local LLM
+    // 2. Triage via local LLM (uses lmscript for structured output)
     const triageResult = await this.triage(userInput);
     this.bus.emit("triage_result", triageResult);
 
@@ -178,7 +178,7 @@ export class ObotoAgent {
     }
 
     // 4. Escalate to remote model with tool access
-    const runtime = triageResult.escalate ? this.remoteRuntime : this.localRuntime;
+    const provider = triageResult.escalate ? this.remoteProvider : this.localProvider;
     const modelName = triageResult.escalate
       ? this.config.remoteModelName
       : this.config.localModelName;
@@ -191,7 +191,7 @@ export class ObotoAgent {
       });
     }
 
-    await this.executeWithModel(runtime, modelName, userInput);
+    await this.executeWithModel(provider, modelName, userInput);
   }
 
   private async triage(userInput: string): Promise<TriageResult> {
@@ -212,79 +212,145 @@ export class ObotoAgent {
     return result.data;
   }
 
+  /**
+   * Execute the agent loop using llm-wrapper directly.
+   * No JSON mode, no schema enforcement — just natural chat with tool calling.
+   */
   private async executeWithModel(
-    runtime: LScriptRuntime,
+    provider: BaseProvider,
     modelName: string,
-    userInput: string
+    _userInput: string
   ): Promise<void> {
+    // Build messages from context manager (includes system prompt + history)
     const contextMessages = this.contextManager.getMessages();
-    const contextStr = contextMessages
-      .filter((m) => m.role !== "system")
-      .map((m) => {
-        const text = typeof m.content === "string" ? m.content : "[complex content]";
-        return `${m.role}: ${text}`;
-      })
-      .join("\n");
 
-    const agentFn: LScriptFunction<AgentInput, typeof AgentResponseSchema> = {
-      name: "agent_execute",
-      model: modelName,
-      system: this.systemPrompt,
-      prompt: ({ context }) =>
-        context
-          ? `Conversation so far:\n${context}\n\nRespond to the user's latest message. Use tools when needed.`
-          : `Respond to the user.`,
-      schema: AgentResponseSchema,
-      temperature: 0.7,
-      tools: [this.routerTool],
-    };
+    // Convert lmscript ChatMessages → llm-wrapper Messages
+    const messages: WrapperMessage[] = contextMessages.map((m) => ({
+      role: m.role,
+      content:
+        typeof m.content === "string"
+          ? m.content
+          : (m.content as Array<{ type: string; text?: string }>)
+              .filter((b) => b.type === "text")
+              .map((b) => b.text ?? "")
+              .join("\n"),
+    }));
 
-    const agent = new AgentLoop(runtime, {
-      maxIterations: this.maxIterations,
-      onToolCall: (toolCall: ToolCall) => {
-        const args = toolCall.arguments as { command?: string; kwargs?: Record<string, unknown> } | undefined;
-        this.bus.emit("tool_execution_start", {
-          command: args?.command ?? toolCall.name,
-          kwargs: args?.kwargs ?? {},
-        });
-        this.bus.emit("tool_execution_complete", {
-          command: args?.command ?? toolCall.name,
-          kwargs: args?.kwargs ?? {},
-          result: toolCall.result,
-        });
-
-        // Check for interruption
-        if (this.interrupted) return false;
+    // Build llm-wrapper tool definitions from the router tool
+    const tool = this.routerTool;
+    const tools: WrapperToolDef[] = [
+      {
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters
+            ? JSON.parse(JSON.stringify(tool.parameters))
+            : { type: "object", properties: {} },
+        },
       },
-      onIteration: (_iteration: number, response: string) => {
-        this.bus.emit("agent_thought", {
-          text: response,
+    ];
+
+    let totalToolCalls = 0;
+
+    for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
+      if (this.interrupted) break;
+
+      const params: StandardChatParams = {
+        model: modelName,
+        messages: [...messages],
+        temperature: 0.7,
+        tools,
+        tool_choice: "auto",
+      };
+
+      const response: StandardChatResponse = await provider.chat(params);
+      const choice = response.choices[0];
+      const content = (choice?.message?.content as string) ?? "";
+
+      // Emit thought for each iteration
+      this.bus.emit("agent_thought", {
+        text: content,
+        model: modelName,
+        iteration,
+      });
+
+      // If no tool calls, this is the final response
+      const toolCalls = choice?.message?.tool_calls;
+      if (!toolCalls || toolCalls.length === 0) {
+        const responseText = content;
+
+        const assistantMsg: ConversationMessage = {
+          role: MessageRole.Assistant,
+          blocks: [{ kind: "text", text: responseText }],
+        };
+        this.session.messages.push(assistantMsg);
+        await this.contextManager.push(toChat(assistantMsg));
+        this.bus.emit("state_updated", { reason: "assistant_response" });
+        this.bus.emit("turn_complete", {
           model: modelName,
-          iteration: _iteration,
+          escalated: true,
+          iterations: iteration,
+          toolCalls: totalToolCalls,
         });
-        if (this.interrupted) return false;
-      },
-    });
+        return;
+      }
 
-    const result = await agent.run(agentFn, {
-      userInput,
-      context: contextStr,
-    });
+      // Append assistant message (with tool_calls) to conversation
+      messages.push({
+        role: "assistant",
+        content: content || null,
+        tool_calls: toolCalls,
+      });
 
-    // Record final response in session and context
-    const responseText = result.data.response;
-    const assistantMsg: ConversationMessage = {
+      // Execute each tool call and feed results back
+      for (const tc of toolCalls) {
+        if (this.interrupted) break;
+
+        let args: Record<string, unknown>;
+        try {
+          args = JSON.parse(tc.function.arguments);
+        } catch {
+          args = {};
+        }
+
+        const command = (args.command as string) ?? tc.function.name;
+        const kwargs = (args.kwargs as Record<string, unknown>) ?? {};
+
+        this.bus.emit("tool_execution_start", { command, kwargs });
+
+        let result: string;
+        try {
+          result = await tool.execute(args);
+        } catch (err) {
+          result = `Error: ${err instanceof Error ? err.message : String(err)}`;
+        }
+
+        this.bus.emit("tool_execution_complete", { command, kwargs, result });
+        totalToolCalls++;
+
+        // Feed tool result back as a tool message (OpenAI format)
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: typeof result === "string" ? result : JSON.stringify(result),
+        });
+      }
+    }
+
+    // Exhausted iterations
+    const fallbackMsg: ConversationMessage = {
       role: MessageRole.Assistant,
-      blocks: [{ kind: "text", text: responseText }],
+      blocks: [{ kind: "text", text: "I reached the maximum number of iterations. Here is what I have so far." }],
     };
-    this.session.messages.push(assistantMsg);
-    await this.contextManager.push(toChat(assistantMsg));
-    this.bus.emit("state_updated", { reason: "assistant_response" });
+    this.session.messages.push(fallbackMsg);
+    await this.contextManager.push(toChat(fallbackMsg));
+    this.bus.emit("state_updated", { reason: "max_iterations" });
     this.bus.emit("turn_complete", {
       model: modelName,
       escalated: true,
-      iterations: result.iterations,
-      toolCalls: result.toolCalls.length,
+      iterations: this.maxIterations,
+      toolCalls: totalToolCalls,
     });
   }
 }

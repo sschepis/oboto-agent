@@ -1,4 +1,4 @@
-import type { LLMProvider } from "@sschepis/lmscript";
+import type { BaseProvider } from "@sschepis/llm-wrapper";
 import type { Router } from "@sschepis/swiss-army-tool";
 import type { Session } from "@sschepis/as-agent";
 
@@ -6,9 +6,9 @@ import type { Session } from "@sschepis/as-agent";
 
 export interface ObotoAgentConfig {
   /** Small, fast model for triage and summarization (e.g. Ollama, LMStudio) */
-  localModel: LLMProvider;
+  localModel: BaseProvider;
   /** Powerful model for complex reasoning (e.g. Anthropic, OpenAI, Gemini) */
-  remoteModel: LLMProvider;
+  remoteModel: BaseProvider;
   /** Model identifier for the local provider (e.g. "llama3:8b") */
   localModelName: string;
   /** Model identifier for the remote provider (e.g. "claude-sonnet-4-20250514") */

@@ -18,6 +18,7 @@ export { AgentEventBus } from "./event-bus.js";
 // Adapters
 export { createRouterTool } from "./adapters/tools.js";
 export { toChat, fromChat, sessionToHistory, createEmptySession } from "./adapters/memory.js";
+export { toLmscriptProvider } from "./adapters/llm-wrapper.js";
 
 // Context management
 export { ContextManager } from "./context-manager.js";

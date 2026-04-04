@@ -5,9 +5,83 @@ import {
   Router,
   SessionManager,
 } from "@sschepis/swiss-army-tool";
-import { MockProvider } from "@sschepis/lmscript";
 import { ObotoAgent } from "../oboto-agent.js";
 import type { AgentEvent } from "../types.js";
+import type {
+  BaseProvider,
+  StandardChatParams,
+  StandardChatResponse,
+  StandardChatChunk,
+} from "@sschepis/llm-wrapper";
+
+/**
+ * Minimal mock that conforms to llm-wrapper's BaseProvider contract.
+ * Returns OpenAI-compatible chat completion responses.
+ */
+class MockLLMProvider {
+  readonly providerName = "mock";
+  private defaultContent: string;
+  private requests: StandardChatParams[] = [];
+
+  constructor(defaultContent = "{}") {
+    this.defaultContent = defaultContent;
+  }
+
+  async chat(params: StandardChatParams): Promise<StandardChatResponse> {
+    this.requests.push(params);
+    return {
+      id: `mock-${Date.now()}`,
+      object: "chat.completion" as const,
+      created: Math.floor(Date.now() / 1000),
+      model: params.model,
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant" as const,
+            content: this.defaultContent,
+          },
+          finish_reason: "stop" as const,
+        },
+      ],
+      usage: {
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+      },
+    };
+  }
+
+  async *stream(
+    params: StandardChatParams
+  ): AsyncIterable<StandardChatChunk> {
+    const response = await this.chat(params);
+    yield {
+      id: response.id,
+      object: "chat.completion.chunk" as const,
+      created: response.created,
+      model: response.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant" as const,
+            content: response.choices[0].message.content as string,
+          },
+          finish_reason: "stop" as const,
+        },
+      ],
+    };
+  }
+
+  getRequestCount(): number {
+    return this.requests.length;
+  }
+
+  getRequests(): StandardChatParams[] {
+    return this.requests;
+  }
+}
 
 function createTestAgent(overrides?: {
   localResponse?: string;
@@ -33,20 +107,17 @@ function createTestAgent(overrides?: {
     directResponse: "Hello! How can I help?",
   });
 
-  const localProvider = new MockProvider({
-    defaultResponse: overrides?.localResponse ?? triageResponse,
-  });
+  const localProvider = new MockLLMProvider(
+    overrides?.localResponse ?? triageResponse
+  );
 
-  const remoteResponse = JSON.stringify({
-    response: "This is the remote model response.",
-  });
-  const remoteProvider = new MockProvider({
-    defaultResponse: overrides?.remoteResponse ?? remoteResponse,
-  });
+  const remoteProvider = new MockLLMProvider(
+    overrides?.remoteResponse ?? "This is the remote model response."
+  );
 
   const agent = new ObotoAgent({
-    localModel: localProvider,
-    remoteModel: remoteProvider,
+    localModel: localProvider as unknown as BaseProvider,
+    remoteModel: remoteProvider as unknown as BaseProvider,
     localModelName: "test-local",
     remoteModelName: "test-remote",
     router,
@@ -79,8 +150,8 @@ describe("ObotoAgent", () => {
       };
 
       const agent = new ObotoAgent({
-        localModel: new MockProvider(),
-        remoteModel: new MockProvider(),
+        localModel: new MockLLMProvider() as unknown as BaseProvider,
+        remoteModel: new MockLLMProvider() as unknown as BaseProvider,
         localModelName: "test",
         remoteModelName: "test",
         router,
