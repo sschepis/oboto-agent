@@ -23,6 +23,8 @@ export interface ObotoAgentConfig {
   maxIterations?: number;
   /** System prompt prepended to all LLM calls */
   systemPrompt?: string;
+  /** Called with each token chunk during LLM streaming. Enables real-time output. */
+  onToken?: (token: string) => void;
 }
 
 // ── Event Bus ──────────────────────────────────────────────────────
@@ -30,9 +32,11 @@ export interface ObotoAgentConfig {
 export type AgentEventType =
   | "user_input"
   | "agent_thought"
+  | "token"
   | "triage_result"
   | "tool_execution_start"
   | "tool_execution_complete"
+  | "tool_round_complete"
   | "state_updated"
   | "interruption"
   | "error"
