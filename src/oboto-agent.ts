@@ -197,6 +197,7 @@ export class ObotoAgent {
       });
     }
 
+    console.log("[ObotoAgent] Executing with model:", modelName, "| provider:", provider.providerName ?? "unknown");
     await this.executeWithModel(provider, modelName, userInput);
   }
 
@@ -292,15 +293,30 @@ export class ObotoAgent {
 
       // Call LLM — streaming or non-streaming
       let response: StandardChatResponse;
-      if (useStreaming) {
-        response = await this.streamAndAggregate(provider, params);
-      } else {
-        response = await provider.chat(params);
+      try {
+        if (useStreaming) {
+          response = await this.streamAndAggregate(provider, params);
+        } else {
+          response = await provider.chat(params);
+        }
+      } catch (err) {
+        // Log and re-throw so submitInput's catch can emit the error event
+        console.error("[ObotoAgent] LLM call failed:", err instanceof Error ? err.message : err);
+        throw err;
       }
 
-      const choice = response.choices[0];
+      const choice = response?.choices?.[0];
       const content = (choice?.message?.content as string) ?? "";
       const toolCalls = choice?.message?.tool_calls;
+
+      // Diagnostic: log if response looks wrong
+      if (!choice) {
+        console.warn("[ObotoAgent] No choices in LLM response:", JSON.stringify(response).substring(0, 500));
+      } else if (!content && (!toolCalls || toolCalls.length === 0)) {
+        console.warn("[ObotoAgent] Empty response — no content, no tool_calls. finish_reason:", choice.finish_reason);
+        console.warn("[ObotoAgent] Messages sent:", messages.length, "| Model:", modelName);
+        console.warn("[ObotoAgent] Tool schema:", JSON.stringify(tools[0]?.function?.parameters).substring(0, 300));
+      }
 
       // Emit thought (the full text for this iteration)
       if (content) {
