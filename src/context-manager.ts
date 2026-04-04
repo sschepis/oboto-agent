@@ -50,10 +50,27 @@ export class ContextManager {
         })
         .join("\n");
 
-      const result = await this.localRuntime.execute(this.summarizeFn, {
-        conversation,
-      });
-      return result.data.summary;
+      try {
+        const result = await this.localRuntime.execute(this.summarizeFn, {
+          conversation,
+        });
+        return result.data.summary;
+      } catch (err) {
+        // If the local LLM fails (timeout, schema error, etc.), fall back
+        // to a simple truncation so we don't crash the agent loop.
+        console.warn(
+          "[ContextManager] Summarization failed, using truncation fallback:",
+          err instanceof Error ? err.message : err
+        );
+        // Keep last ~500 chars of each message as a crude summary
+        return messages
+          .slice(-3)
+          .map((m) => {
+            const text = typeof m.content === "string" ? m.content : "[complex]";
+            return `${m.role}: ${text.slice(-500)}`;
+          })
+          .join("\n");
+      }
     });
   }
 
