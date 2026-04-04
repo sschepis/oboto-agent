@@ -1,6 +1,6 @@
 {
   "name": "@sschepis/oboto-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Event-driven dual-LLM orchestration library for autonomous AI agents",
   "type": "module",
   "main": "./dist/index.js",
