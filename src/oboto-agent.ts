@@ -9,6 +9,7 @@ import type {
   StandardChatResponse,
 } from "@sschepis/llm-wrapper";
 import { aggregateStream } from "@sschepis/llm-wrapper";
+import { zodToJsonSchema } from "zod-to-json-schema";
 import type { Session, ConversationMessage } from "@sschepis/as-agent";
 import { MessageRole } from "@sschepis/as-agent";
 import type { ObotoAgentConfig, AgentEventType, AgentEvent, TriageResult } from "./types.js";
@@ -248,15 +249,17 @@ export class ObotoAgent {
     }));
 
     const tool = this.routerTool;
+    // Convert Zod schema → JSON Schema for the LLM
+    const parametersSchema = tool.parameters
+      ? (zodToJsonSchema(tool.parameters, { target: "openApi3" }) as Record<string, unknown>)
+      : { type: "object", properties: {} };
     const tools: WrapperToolDef[] = [
       {
         type: "function",
         function: {
           name: tool.name,
           description: tool.description,
-          parameters: tool.parameters
-            ? JSON.parse(JSON.stringify(tool.parameters))
-            : { type: "object", properties: {} },
+          parameters: parametersSchema,
         },
       },
     ];
