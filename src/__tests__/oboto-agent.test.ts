@@ -309,20 +309,20 @@ describe("ObotoAgent", () => {
   });
 
   describe("interruption", () => {
-    it("emits interruption event", () => {
+    it("emits interruption event", async () => {
       const { agent } = createTestAgent();
       const events: AgentEvent[] = [];
       agent.on("interruption", (e) => events.push(e));
 
-      agent.interrupt("New directive");
+      await agent.interrupt("New directive");
 
       expect(events).toHaveLength(1);
       expect((events[0].payload as any).newDirectives).toBe("New directive");
     });
 
-    it("records interruption in session", () => {
+    it("records interruption in session", async () => {
       const { agent } = createTestAgent();
-      agent.interrupt("Stop and do this instead");
+      await agent.interrupt("Stop and do this instead");
 
       const session = agent.getSession();
       expect(session.messages).toHaveLength(1);
@@ -332,12 +332,12 @@ describe("ObotoAgent", () => {
       });
     });
 
-    it("emits state_updated on interruption", () => {
+    it("emits state_updated on interruption", async () => {
       const { agent } = createTestAgent();
       const events: AgentEvent[] = [];
       agent.on("state_updated", (e) => events.push(e));
 
-      agent.interrupt("Change course");
+      await agent.interrupt("Change course");
 
       expect(events).toHaveLength(1);
       expect((events[0].payload as any).reason).toBe("interruption");

@@ -11,7 +11,8 @@ export const TriageSchema = z.object({
     .describe("Brief explanation of the triage decision"),
   directResponse: z
     .string()
-    .optional()
+    .nullish()
+    .transform(v => v ?? undefined)
     .describe("Direct answer if the request can be handled without escalation"),
 });
 
@@ -27,10 +28,13 @@ casual chat, short lookups) or needs to be escalated to a more powerful model
 (complex reasoning, multi-step tool usage, code generation, analysis).
 
 Rules:
-- If the request is a greeting, simple question, or casual conversation: respond directly.
+- Only respond directly for truly trivial exchanges: greetings, thanks, or very simple factual questions.
+- When responding directly, use a natural, warm, conversational tone. Do NOT list capabilities or describe what tools you have access to.
+- If the user's message could benefit from tool usage or detailed reasoning, always escalate.
 - If the request needs tool calls, code analysis, or multi-step reasoning: escalate.
 - If unsure, escalate. It's better to over-escalate than to give a poor direct answer.
 - Keep directResponse under 200 words when answering directly.
+- Pay attention to the recent context — if the user is continuing a conversation, your response should reflect that context.
 
 Respond with JSON matching the schema.`;
 
