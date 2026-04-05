@@ -13,7 +13,6 @@ export type {
   ToolExecutionEvent,
   ProviderLike,
   PhaseEvent,
-  HeartbeatEvent,
   DoomLoopEvent,
   ToolRoundEvent,
 } from "./types.js";

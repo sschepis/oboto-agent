@@ -76,7 +76,7 @@ export class ObotoAgent {
   private maxIterations: number;
   private config: ObotoAgentConfig;
   private onToken?: (token: string) => void;
-  private costTracker?: CostTracker;
+  private costTracker: CostTracker;
   private modelPricing?: ModelPricing;
   private rateLimiter?: RateLimiter;
   private middleware!: MiddlewareManager;
@@ -89,8 +89,6 @@ export class ObotoAgent {
   private usageTracker: AgentUsageTracker;
   private usageBridge: UsageBridge;
   private routerEventBridge: RouterEventBridge;
-  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  private heartbeatStart = 0;
   private currentPhase: AgentPhase = "request";
 
   constructor(config: ObotoAgentConfig) {
@@ -111,11 +109,10 @@ export class ObotoAgent {
     }
 
     // ── Build cost tracker (shared across runtimes for unified reporting) ─
-    // CostTracker takes no constructor args; pricing is passed to getTotalCost()
-    if (config.modelPricing) {
-      this.costTracker = new CostTracker();
-      this.modelPricing = config.modelPricing;
-    }
+    // Always create a CostTracker so token counts are tracked even without pricing.
+    // Pricing is passed to getTotalCost() when available.
+    this.costTracker = new CostTracker();
+    this.modelPricing = config.modelPricing;
 
     // ── Build local runtime (lightweight: cache for triage, no rate limit) ─
     // ExecutionCache takes only a CacheBackend; TTL is handled per-entry
@@ -445,53 +442,47 @@ export class ObotoAgent {
     this.bus.emit("phase", { phase, message });
   }
 
-  /** Start a heartbeat that re-emits the current phase every intervalMs. */
-  private startHeartbeat(phase: AgentPhase, intervalMs = 3000): void {
-    this.stopHeartbeat();
-    this.heartbeatStart = Date.now();
-    this.currentPhase = phase;
-    this.heartbeatTimer = setInterval(() => {
-      const elapsed = Date.now() - this.heartbeatStart;
-      const secs = Math.round(elapsed / 1000);
-      const message = phase === "thinking"
-        ? `Waiting for AI response… (${secs}s)`
-        : `${phase}… (${secs}s)`;
-      this.bus.emit("heartbeat", { phase: this.currentPhase, elapsedMs: elapsed, message });
-    }, intervalMs);
-  }
-
-  /** Stop the heartbeat timer. */
-  private stopHeartbeat(): void {
-    if (this.heartbeatTimer) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
-  }
-
   /**
    * Build a human-readable narrative for a batch of tool executions.
-   * E.g. "Just read file data, and ran a command. Sending results back to AI for next steps…"
+   * Uses both command name and kwargs to produce accurate descriptions.
+   * E.g. "Just read file data, and edited files. Sending results back to AI for next steps…"
    */
   private buildToolRoundNarrative(
-    tools: Array<{ command: string; success: boolean }>
+    tools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown> }>
   ): string {
     if (tools.length === 0) return "No tools executed.";
 
-    // Group tools by action verb
+    // Classify each tool call by examining both the command and its kwargs
     const verbs = new Map<string, string[]>();
     for (const t of tools) {
       const cmd = t.command.toLowerCase();
+      const kw = t.kwargs || {};
+      const kwStr = JSON.stringify(kw).toLowerCase();
+
       let verb: string;
-      if (cmd.includes("read") || cmd.includes("cat") || cmd.includes("get")) {
+      // Check kwargs for more specific classification
+      if (kwStr.includes('"cmd"') && (kwStr.includes("cat ") || kwStr.includes("head ") || kwStr.includes("tail "))) {
         verb = "read file data";
-      } else if (cmd.includes("write") || cmd.includes("edit") || cmd.includes("patch")) {
+      } else if (kwStr.includes('"cmd"') && (kwStr.includes("ls ") || kwStr.includes("find ") || kwStr.includes("tree "))) {
+        verb = "listed files";
+      } else if (kwStr.includes('"cmd"') && (kwStr.includes("grep ") || kwStr.includes("rg ") || kwStr.includes("ag "))) {
+        verb = "searched for information";
+      } else if (cmd.includes("read") || cmd.includes("get_file") || cmd.includes("view")) {
+        verb = "read file data";
+      } else if (cmd.includes("write") || cmd.includes("edit") || cmd.includes("patch") || cmd.includes("update")) {
         verb = "edited files";
       } else if (cmd.includes("search") || cmd.includes("grep") || cmd.includes("find") || cmd.includes("glob")) {
         verb = "searched for information";
+      } else if (cmd.includes("list") || cmd.includes("ls")) {
+        verb = "listed items";
       } else if (cmd.includes("run") || cmd.includes("exec") || cmd.includes("bash") || cmd.includes("shell")) {
         verb = "ran a command";
       } else if (cmd.includes("browse") || cmd.includes("web") || cmd.includes("fetch")) {
         verb = "browsed the web";
+      } else if (cmd.includes("surface")) {
+        verb = cmd.includes("read") ? "read surface data" : "accessed surfaces";
+      } else if (cmd.includes("help")) {
+        verb = "checked available tools";
       } else {
         verb = `used ${t.command}`;
       }
@@ -587,11 +578,11 @@ export class ObotoAgent {
     }
 
     // ── Phase: Precheck (Triage) ──
+    // StreamController's ActivityTracker handles heartbeat automatically
+    // when phaseStart is called, so we don't need our own timer.
     this.emitPhase("precheck", "Checking if direct answer is possible…");
-    this.startHeartbeat("precheck");
 
     const triageResult = await this.triage(userInput);
-    this.stopHeartbeat();
     this.bus.emit("triage_result", triageResult);
 
     if (this.interrupted) return;
@@ -613,13 +604,10 @@ export class ObotoAgent {
     }
 
     // 4. Escalate to remote model with tool access
+    // Note: triage_result event already carries the reasoning for the provider to display.
+    // We only emit the phase transition here — no duplicate agent_thought.
     if (triageResult.escalate) {
-      this.emitPhase("thinking", `Escalating to remote model: ${triageResult.reasoning}`);
-      this.bus.emit("agent_thought", {
-        text: triageResult.reasoning,
-        model: "local",
-        escalating: true,
-      });
+      this.emitPhase("thinking", "Entering agent loop with remote model…");
     } else {
       this.emitPhase("thinking", "This requires tools and deeper reasoning — entering agent loop.");
     }
@@ -676,7 +664,6 @@ export class ObotoAgent {
     const { z } = await import("zod");
 
     this.emitPhase("thinking", `Turn 1/${this.maxIterations}: Analyzing request…`);
-    this.startHeartbeat("thinking");
 
     const agentFn = {
       name: "agent-task",
@@ -704,7 +691,7 @@ export class ObotoAgent {
     };
 
     // Track tool calls per iteration for narrative building
-    let iterationTools: Array<{ command: string; success: boolean }> = [];
+    let iterationTools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown> }> = [];
     let totalToolCalls = 0;
 
     const agentConfig: AgentConfig = {
@@ -724,14 +711,12 @@ export class ObotoAgent {
         this.bus.emit("tool_execution_start", { command, kwargs });
         this.bus.emit("tool_execution_complete", { command, kwargs, result: resultStr });
 
-        iterationTools.push({ command: String(command), success: !isError });
+        iterationTools.push({ command: String(command), success: !isError, kwargs: kwargs as Record<string, unknown> });
         totalToolCalls++;
 
         this.recordToolResult(String(command), kwargs as Record<string, unknown>, resultStr);
       },
       onIteration: (iteration: number, response: string) => {
-        this.stopHeartbeat();
-
         // Emit tool round narrative if tools were called this iteration
         if (iterationTools.length > 0) {
           const narrative = this.buildToolRoundNarrative(iterationTools);
@@ -756,52 +741,45 @@ export class ObotoAgent {
 
         // Announce next iteration
         this.emitPhase("thinking", `Turn ${iteration + 1}/${this.maxIterations}: Analyzing results…`);
-        this.startHeartbeat("thinking");
 
         if (this.interrupted) return false;
       },
     };
 
     const agentLoop = new AgentLoop(runtime, agentConfig);
+    const result = await agentLoop.run(agentFn, userInput);
 
-    try {
-      const result = await agentLoop.run(agentFn, userInput);
-      this.stopHeartbeat();
-
-      // Emit final tool round if pending
-      if (iterationTools.length > 0) {
-        const narrative = this.buildToolRoundNarrative(iterationTools);
-        this.bus.emit("tool_round_complete", {
-          iteration: result.iterations,
-          tools: iterationTools,
-          totalToolCalls,
-          narrative,
-        });
-      }
-
-      // ── Phase: Memory ──
-      this.emitPhase("memory", "Recording interaction…");
-
-      const responseText = result.data.response;
-      const assistantMsg: ConversationMessage = {
-        role: MessageRole.Assistant,
-        blocks: [{ kind: "text", text: responseText }],
-      };
-      await this.recordMessage(assistantMsg);
-      this.bus.emit("state_updated", { reason: "assistant_response" });
-
-      // ── Phase: Complete ──
-      this.emitPhase("complete", "Response ready.");
-      this.bus.emit("turn_complete", {
-        model: modelName,
-        escalated: true,
-        iterations: result.iterations,
-        toolCalls: result.toolCalls.length,
-        usage: result.usage,
+    // Emit final tool round if pending
+    if (iterationTools.length > 0) {
+      const narrative = this.buildToolRoundNarrative(iterationTools);
+      this.bus.emit("tool_round_complete", {
+        iteration: result.iterations,
+        tools: iterationTools,
+        totalToolCalls,
+        narrative,
       });
-    } finally {
-      this.stopHeartbeat();
     }
+
+    // ── Phase: Memory ──
+    this.emitPhase("memory", "Recording interaction…");
+
+    const responseText = result.data.response;
+    const assistantMsg: ConversationMessage = {
+      role: MessageRole.Assistant,
+      blocks: [{ kind: "text", text: responseText }],
+    };
+    await this.recordMessage(assistantMsg);
+    this.bus.emit("state_updated", { reason: "assistant_response" });
+
+    // ── Phase: Complete ──
+    this.emitPhase("complete", "Response ready.");
+    this.bus.emit("turn_complete", {
+      model: modelName,
+      escalated: true,
+      iterations: result.iterations,
+      toolCalls: result.toolCalls.length,
+      usage: result.usage,
+    });
   }
 
   /**
@@ -884,10 +862,9 @@ export class ObotoAgent {
           "thinking",
           `Turn ${iteration}/${this.maxIterations}: ${iteration === 1 ? "Analyzing request…" : "Analyzing results…"}`
         );
-        this.startHeartbeat("thinking");
 
         // ── Budget check ──
-        if (this.costTracker && this.budget) {
+        if (this.budget) {
           this.costTracker.checkBudget(this.budget);
         }
 
@@ -917,7 +894,6 @@ export class ObotoAgent {
         try {
           response = await this.streamAndAggregate(provider, params);
         } catch (err) {
-          this.stopHeartbeat();
           this.emitPhase("error", `LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
           await this.middleware.runError(
             syntheticCtx,
@@ -925,8 +901,6 @@ export class ObotoAgent {
           );
           throw err;
         }
-
-        this.stopHeartbeat();
 
         // ── Usage tracking ──
         const usage = response?.usage;
@@ -946,13 +920,11 @@ export class ObotoAgent {
             totalTokens: usageTotal,
           });
 
-          if (this.costTracker) {
-            this.bus.emit("cost_update", {
-              iteration,
-              totalTokens: this.costTracker.getTotalTokens(),
-              totalCost: this.costTracker.getTotalCost(this.modelPricing),
-            });
-          }
+          this.bus.emit("cost_update", {
+            iteration,
+            totalTokens: this.costTracker.getTotalTokens(),
+            totalCost: this.costTracker.getTotalCost(this.modelPricing),
+          });
         }
 
         const choice = response?.choices?.[0];
@@ -1015,7 +987,7 @@ export class ObotoAgent {
         });
 
         // Track tools this round for narrative
-        const roundTools: Array<{ command: string; success: boolean }> = [];
+        const roundTools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown> }> = [];
 
         for (let ti = 0; ti < toolCalls.length; ti++) {
           const tc = toolCalls[ti];
@@ -1177,7 +1149,7 @@ export class ObotoAgent {
 
           this.bus.emit("tool_execution_complete", { command, kwargs, result: truncated, error: isError ? truncated : undefined });
           this.recordToolResult(command, kwargs, truncated);
-          roundTools.push({ command, success: !isError });
+          roundTools.push({ command, success: !isError, kwargs });
           totalToolCalls++;
 
           messages.push({
@@ -1225,7 +1197,6 @@ export class ObotoAgent {
       } as any);
 
     } catch (err) {
-      this.stopHeartbeat();
       this.emitPhase("error", `Error: ${err instanceof Error ? err.message : String(err)}`);
       if (!(err instanceof Error && err.message.includes("LLM call failed"))) {
         await this.middleware.runError(
@@ -1234,8 +1205,6 @@ export class ObotoAgent {
         );
       }
       throw err;
-    } finally {
-      this.stopHeartbeat();
     }
   }
 

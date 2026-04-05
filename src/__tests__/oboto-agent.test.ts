@@ -294,17 +294,24 @@ describe("ObotoAgent", () => {
         localResponse: triageResponse,
       });
 
-      const thoughts: AgentEvent[] = [];
-      agent.on("agent_thought", (e) => thoughts.push(e));
+      const triageEvents: AgentEvent[] = [];
+      agent.on("triage_result", (e) => triageEvents.push(e));
+      const phaseEvents: AgentEvent[] = [];
+      agent.on("phase", (e) => phaseEvents.push(e));
 
       await agent.submitInput("Analyze the codebase");
 
       expect(remoteProvider.getRequestCount()).toBeGreaterThan(0);
-      // Should emit an escalation thought
-      const escalationThought = thoughts.find(
-        (t) => (t.payload as any).escalating === true
+      // Should emit a triage_result with escalate: true
+      const triageEvent = triageEvents.find(
+        (t) => (t.payload as any).escalate === true
       );
-      expect(escalationThought).toBeDefined();
+      expect(triageEvent).toBeDefined();
+      // Should emit a thinking phase transition
+      const thinkingPhase = phaseEvents.find(
+        (t) => (t.payload as any).phase === "thinking"
+      );
+      expect(thinkingPhase).toBeDefined();
     });
   });
 

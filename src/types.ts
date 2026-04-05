@@ -125,8 +125,7 @@ export type AgentEventType =
   | "hook_message"
   | "router_event"
   | "slash_command"
-  | "doom_loop"
-  | "heartbeat";
+  | "doom_loop";
 
 /** Phase identifiers matching the unified provider's phase system. */
 export type AgentPhase =
@@ -149,13 +148,6 @@ export interface PhaseEvent {
   message: string;
 }
 
-/** Payload for heartbeat events. */
-export interface HeartbeatEvent {
-  phase: AgentPhase;
-  elapsedMs: number;
-  message: string;
-}
-
 /** Payload for doom loop events. */
 export interface DoomLoopEvent {
   reason: string;
@@ -167,7 +159,7 @@ export interface DoomLoopEvent {
 /** Payload for tool round completion with narrative. */
 export interface ToolRoundEvent {
   iteration: number;
-  tools: Array<{ command: string; success: boolean; durationMs?: number }>;
+  tools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown>; durationMs?: number }>;
   totalToolCalls: number;
   narrative: string;
 }
