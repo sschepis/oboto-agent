@@ -109,6 +109,7 @@ export type AgentEventType =
   | "user_input"
   | "agent_thought"
   | "token"
+  | "phase"
   | "triage_result"
   | "tool_execution_start"
   | "tool_execution_complete"
@@ -123,7 +124,53 @@ export type AgentEventType =
   | "hook_denied"
   | "hook_message"
   | "router_event"
-  | "slash_command";
+  | "slash_command"
+  | "doom_loop"
+  | "heartbeat";
+
+/** Phase identifiers matching the unified provider's phase system. */
+export type AgentPhase =
+  | "request"
+  | "precheck"
+  | "planning"
+  | "thinking"
+  | "tools"
+  | "validation"
+  | "memory"
+  | "continuation"
+  | "error"
+  | "doom"
+  | "cancel"
+  | "complete";
+
+/** Payload for phase events. */
+export interface PhaseEvent {
+  phase: AgentPhase;
+  message: string;
+}
+
+/** Payload for heartbeat events. */
+export interface HeartbeatEvent {
+  phase: AgentPhase;
+  elapsedMs: number;
+  message: string;
+}
+
+/** Payload for doom loop events. */
+export interface DoomLoopEvent {
+  reason: string;
+  command: string;
+  count: number;
+  redirected: boolean;
+}
+
+/** Payload for tool round completion with narrative. */
+export interface ToolRoundEvent {
+  iteration: number;
+  tools: Array<{ command: string; success: boolean; durationMs?: number }>;
+  totalToolCalls: number;
+  narrative: string;
+}
 
 export interface AgentEvent<T = unknown> {
   type: AgentEventType;

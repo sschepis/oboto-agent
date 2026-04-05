@@ -8,9 +8,14 @@ export type {
   ObotoAgentConfig,
   AgentEventType,
   AgentEvent,
+  AgentPhase,
   TriageResult,
   ToolExecutionEvent,
   ProviderLike,
+  PhaseEvent,
+  HeartbeatEvent,
+  DoomLoopEvent,
+  ToolRoundEvent,
 } from "./types.js";
 
 // Event bus

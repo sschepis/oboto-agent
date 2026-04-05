@@ -20,7 +20,10 @@ import type {
 import { aggregateStream } from "@sschepis/llm-wrapper";
 import type { Session, ConversationMessage } from "@sschepis/as-agent";
 import { MessageRole } from "@sschepis/as-agent";
-import type { ObotoAgentConfig, AgentEventType, AgentEvent, TriageResult, ProviderLike } from "./types.js";
+import type {
+  ObotoAgentConfig, AgentEventType, AgentEvent, TriageResult, ProviderLike,
+  AgentPhase, ToolRoundEvent,
+} from "./types.js";
 import { AgentEventBus } from "./event-bus.js";
 import { ContextManager } from "./context-manager.js";
 import { createTriageFunction } from "./triage.js";
@@ -86,6 +89,9 @@ export class ObotoAgent {
   private usageTracker: AgentUsageTracker;
   private usageBridge: UsageBridge;
   private routerEventBridge: RouterEventBridge;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatStart = 0;
+  private currentPhase: AgentPhase = "request";
 
   constructor(config: ObotoAgentConfig) {
     this.config = config;
@@ -431,6 +437,89 @@ export class ObotoAgent {
     return context || undefined;
   }
 
+  // ── Conversational helpers ──────────────────────────────────────────
+
+  /** Emit a phase transition event with a human-readable message. */
+  private emitPhase(phase: AgentPhase, message: string): void {
+    this.currentPhase = phase;
+    this.bus.emit("phase", { phase, message });
+  }
+
+  /** Start a heartbeat that re-emits the current phase every intervalMs. */
+  private startHeartbeat(phase: AgentPhase, intervalMs = 3000): void {
+    this.stopHeartbeat();
+    this.heartbeatStart = Date.now();
+    this.currentPhase = phase;
+    this.heartbeatTimer = setInterval(() => {
+      const elapsed = Date.now() - this.heartbeatStart;
+      const secs = Math.round(elapsed / 1000);
+      const message = phase === "thinking"
+        ? `Waiting for AI response… (${secs}s)`
+        : `${phase}… (${secs}s)`;
+      this.bus.emit("heartbeat", { phase: this.currentPhase, elapsedMs: elapsed, message });
+    }, intervalMs);
+  }
+
+  /** Stop the heartbeat timer. */
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  /**
+   * Build a human-readable narrative for a batch of tool executions.
+   * E.g. "Just read file data, and ran a command. Sending results back to AI for next steps…"
+   */
+  private buildToolRoundNarrative(
+    tools: Array<{ command: string; success: boolean }>
+  ): string {
+    if (tools.length === 0) return "No tools executed.";
+
+    // Group tools by action verb
+    const verbs = new Map<string, string[]>();
+    for (const t of tools) {
+      const cmd = t.command.toLowerCase();
+      let verb: string;
+      if (cmd.includes("read") || cmd.includes("cat") || cmd.includes("get")) {
+        verb = "read file data";
+      } else if (cmd.includes("write") || cmd.includes("edit") || cmd.includes("patch")) {
+        verb = "edited files";
+      } else if (cmd.includes("search") || cmd.includes("grep") || cmd.includes("find") || cmd.includes("glob")) {
+        verb = "searched for information";
+      } else if (cmd.includes("run") || cmd.includes("exec") || cmd.includes("bash") || cmd.includes("shell")) {
+        verb = "ran a command";
+      } else if (cmd.includes("browse") || cmd.includes("web") || cmd.includes("fetch")) {
+        verb = "browsed the web";
+      } else {
+        verb = `used ${t.command}`;
+      }
+      if (!verbs.has(verb)) verbs.set(verb, []);
+      verbs.get(verb)!.push(t.command);
+    }
+
+    const parts = Array.from(verbs.keys());
+    let narrative: string;
+    if (parts.length === 1) {
+      narrative = `Just ${parts[0]}.`;
+    } else if (parts.length === 2) {
+      narrative = `Just ${parts[0]}, and ${parts[1]}.`;
+    } else {
+      const last = parts.pop()!;
+      narrative = `Just ${parts.join(", ")}, and ${last}.`;
+    }
+
+    const errors = tools.filter(t => !t.success);
+    if (errors.length > 0) {
+      const errNames = errors.map(e => e.command).join(", ");
+      narrative += ` (${errors.length} error${errors.length > 1 ? "s" : ""}: ${errNames})`;
+    }
+
+    narrative += " Sending results back to AI for next steps…";
+    return narrative;
+  }
+
   // ── Internal ───────────────────────────────────────────────────────
 
   /**
@@ -462,6 +551,9 @@ export class ObotoAgent {
   }
 
   private async executionLoop(userInput: string): Promise<void> {
+    // ── Phase: Request ──
+    this.emitPhase("request", `Processing: ${userInput.substring(0, 80)}${userInput.length > 80 ? "…" : ""}`);
+
     // 1. Emit user_input and record in session + context + RAG
     this.bus.emit("user_input", { text: userInput });
 
@@ -472,15 +564,21 @@ export class ObotoAgent {
     await this.recordMessage(userMsg);
     this.bus.emit("state_updated", { reason: "user_input" });
 
+    // ── Phase: Planning ──
+    this.emitPhase("planning", "Building context and preparing tools…");
+
     // 1b. Optionally augment context with RAG-retrieved past conversation
     if (this.conversationRAG) {
       try {
         const { context } = await this.conversationRAG.retrieve(userInput);
         if (context) {
-          // Inject RAG context as a system-level hint
           await this.contextManager.push({
             role: "system",
             content: context,
+          });
+          this.bus.emit("agent_thought", {
+            text: "Retrieved relevant past context via RAG.",
+            model: "system",
           });
         }
       } catch (err) {
@@ -488,8 +586,12 @@ export class ObotoAgent {
       }
     }
 
-    // 2. Triage via local LLM (uses lmscript for structured output, cached)
+    // ── Phase: Precheck (Triage) ──
+    this.emitPhase("precheck", "Checking if direct answer is possible…");
+    this.startHeartbeat("precheck");
+
     const triageResult = await this.triage(userInput);
+    this.stopHeartbeat();
     this.bus.emit("triage_result", triageResult);
 
     if (this.interrupted) return;
@@ -497,6 +599,7 @@ export class ObotoAgent {
     // 3. If local can handle directly, emit and return
     if (!triageResult.escalate && triageResult.directResponse) {
       const response = triageResult.directResponse;
+      this.emitPhase("complete", "Answered directly — no tools needed.");
       this.bus.emit("agent_thought", { text: response, model: "local" });
 
       const assistantMsg: ConversationMessage = {
@@ -509,13 +612,16 @@ export class ObotoAgent {
       return;
     }
 
-    // 4. Escalate to remote model with tool access via lmscript AgentLoop
+    // 4. Escalate to remote model with tool access
     if (triageResult.escalate) {
+      this.emitPhase("thinking", `Escalating to remote model: ${triageResult.reasoning}`);
       this.bus.emit("agent_thought", {
         text: triageResult.reasoning,
         model: "local",
         escalating: true,
       });
+    } else {
+      this.emitPhase("thinking", "This requires tools and deeper reasoning — entering agent loop.");
     }
 
     const modelName = triageResult.escalate
@@ -526,14 +632,9 @@ export class ObotoAgent {
       ? this.remoteRuntime
       : this.localRuntime;
 
-    console.log("[ObotoAgent] Executing with model:", modelName, "| via lmscript AgentLoop");
-
     if (this.onToken) {
-      // Streaming path: use raw provider streaming with token emission,
-      // then use AgentLoop for the structured tool calling
       await this.executeWithStreaming(runtime, modelName, userInput);
     } else {
-      // Non-streaming path: delegate entirely to lmscript AgentLoop
       await this.executeWithAgentLoop(runtime, modelName, userInput);
     }
   }
@@ -574,15 +675,14 @@ export class ObotoAgent {
   ): Promise<void> {
     const { z } = await import("zod");
 
-    // Define the agent task function
-    // We use a permissive schema for the final output since the agent
-    // produces natural text + reasoning, not a strict structured format
+    this.emitPhase("thinking", `Turn 1/${this.maxIterations}: Analyzing request…`);
+    this.startHeartbeat("thinking");
+
     const agentFn = {
       name: "agent-task",
       model: modelName,
       system: this.systemPrompt,
       prompt: (input: string) => {
-        // Include conversation context in the prompt
         const contextMessages = this.contextManager.getMessages();
         const contextStr = contextMessages
           .filter(m => m.role !== "system")
@@ -603,6 +703,10 @@ export class ObotoAgent {
       maxRetries: 1,
     };
 
+    // Track tool calls per iteration for narrative building
+    let iterationTools: Array<{ command: string; success: boolean }> = [];
+    let totalToolCalls = 0;
+
     const agentConfig: AgentConfig = {
       maxIterations: this.maxIterations,
       onToolCall: (tc: ToolCall) => {
@@ -613,47 +717,91 @@ export class ObotoAgent {
           ? (tc.arguments as Record<string, unknown>).kwargs ?? {}
           : {};
 
-        this.bus.emit("tool_execution_complete", {
-          command,
-          kwargs,
-          result: typeof tc.result === "string" ? tc.result : JSON.stringify(tc.result),
-        });
-
-        // Index tool result for RAG retrieval
         const resultStr = typeof tc.result === "string" ? tc.result : JSON.stringify(tc.result);
+        const isError = resultStr.startsWith("Error:");
+
+        this.emitPhase("tools", `Running tool: ${String(command)}`);
+        this.bus.emit("tool_execution_start", { command, kwargs });
+        this.bus.emit("tool_execution_complete", { command, kwargs, result: resultStr });
+
+        iterationTools.push({ command: String(command), success: !isError });
+        totalToolCalls++;
+
         this.recordToolResult(String(command), kwargs as Record<string, unknown>, resultStr);
       },
       onIteration: (iteration: number, response: string) => {
-        this.bus.emit("agent_thought", {
-          text: response,
-          model: modelName,
-          iteration,
-        });
+        this.stopHeartbeat();
 
-        // Return false to stop early if interrupted
+        // Emit tool round narrative if tools were called this iteration
+        if (iterationTools.length > 0) {
+          const narrative = this.buildToolRoundNarrative(iterationTools);
+          const roundEvent: ToolRoundEvent = {
+            iteration,
+            tools: iterationTools,
+            totalToolCalls,
+            narrative,
+          };
+          this.bus.emit("tool_round_complete", roundEvent);
+          iterationTools = [];
+        }
+
+        // Forward AI text
+        if (response) {
+          this.bus.emit("agent_thought", {
+            text: response,
+            model: modelName,
+            iteration,
+          });
+        }
+
+        // Announce next iteration
+        this.emitPhase("thinking", `Turn ${iteration + 1}/${this.maxIterations}: Analyzing results…`);
+        this.startHeartbeat("thinking");
+
         if (this.interrupted) return false;
       },
     };
 
     const agentLoop = new AgentLoop(runtime, agentConfig);
-    const result = await agentLoop.run(agentFn, userInput);
 
-    // Record the final response
-    const responseText = result.data.response;
+    try {
+      const result = await agentLoop.run(agentFn, userInput);
+      this.stopHeartbeat();
 
-    const assistantMsg: ConversationMessage = {
-      role: MessageRole.Assistant,
-      blocks: [{ kind: "text", text: responseText }],
-    };
-    await this.recordMessage(assistantMsg);
-    this.bus.emit("state_updated", { reason: "assistant_response" });
-    this.bus.emit("turn_complete", {
-      model: modelName,
-      escalated: true,
-      iterations: result.iterations,
-      toolCalls: result.toolCalls.length,
-      usage: result.usage,
-    });
+      // Emit final tool round if pending
+      if (iterationTools.length > 0) {
+        const narrative = this.buildToolRoundNarrative(iterationTools);
+        this.bus.emit("tool_round_complete", {
+          iteration: result.iterations,
+          tools: iterationTools,
+          totalToolCalls,
+          narrative,
+        });
+      }
+
+      // ── Phase: Memory ──
+      this.emitPhase("memory", "Recording interaction…");
+
+      const responseText = result.data.response;
+      const assistantMsg: ConversationMessage = {
+        role: MessageRole.Assistant,
+        blocks: [{ kind: "text", text: responseText }],
+      };
+      await this.recordMessage(assistantMsg);
+      this.bus.emit("state_updated", { reason: "assistant_response" });
+
+      // ── Phase: Complete ──
+      this.emitPhase("complete", "Response ready.");
+      this.bus.emit("turn_complete", {
+        model: modelName,
+        escalated: true,
+        iterations: result.iterations,
+        toolCalls: result.toolCalls.length,
+        usage: result.usage,
+      });
+    } finally {
+      this.stopHeartbeat();
+    }
   }
 
   /**
@@ -681,7 +829,6 @@ export class ObotoAgent {
 
     const contextMessages = this.contextManager.getMessages();
 
-    // Convert lmscript ChatMessages -> llm-wrapper Messages
     const messages: import("@sschepis/llm-wrapper").Message[] = contextMessages.map((m) => ({
       role: m.role,
       content:
@@ -710,12 +857,12 @@ export class ObotoAgent {
 
     let totalToolCalls = 0;
     const callHistory: string[] = [];
+    // Track consecutive duplicate patterns for doom loop detection
+    const consecutiveDupes = new Map<string, number>();
+    let doomLoopRedirected = false;
     const turnStartTime = Date.now();
     const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
-    // ── Middleware: signal turn start ──
-    // We create a synthetic ExecutionContext for middleware hooks.
-    // The streaming path doesn't have an LScriptFunction, so we approximate.
     const syntheticCtx = {
       fn: { name: "streaming-turn", model: modelName, system: this.systemPrompt, prompt: () => "", schema: {} as any },
       input: _userInput,
@@ -727,19 +874,29 @@ export class ObotoAgent {
 
     try {
       for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
-        if (this.interrupted) break;
+        if (this.interrupted) {
+          this.emitPhase("cancel", "Interrupted by user.");
+          break;
+        }
 
-        // ── Budget check before each LLM call ──
+        // ── Phase: Thinking with iteration context ──
+        this.emitPhase(
+          "thinking",
+          `Turn ${iteration}/${this.maxIterations}: ${iteration === 1 ? "Analyzing request…" : "Analyzing results…"}`
+        );
+        this.startHeartbeat("thinking");
+
+        // ── Budget check ──
         if (this.costTracker && this.budget) {
           this.costTracker.checkBudget(this.budget);
         }
 
-        // ── Rate limit: wait for slot ──
         await this.rateLimiter?.acquire();
 
         const isLastIteration = iteration === this.maxIterations;
 
         if (isLastIteration) {
+          this.emitPhase("continuation", "Maximum iterations reached — synthesizing final response…");
           messages.push({
             role: "user",
             content:
@@ -756,21 +913,22 @@ export class ObotoAgent {
             : { tools, tool_choice: "auto" as const }),
         };
 
-        // Stream and aggregate
         let response: StandardChatResponse;
         try {
           response = await this.streamAndAggregate(provider, params);
         } catch (err) {
-          // ── Middleware: signal error ──
+          this.stopHeartbeat();
+          this.emitPhase("error", `LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
           await this.middleware.runError(
             syntheticCtx,
             err instanceof Error ? err : new Error(String(err))
           );
-          console.error("[ObotoAgent] LLM call failed:", err instanceof Error ? err.message : err);
           throw err;
         }
 
-        // ── Extract usage from the aggregated response ──
+        this.stopHeartbeat();
+
+        // ── Usage tracking ──
         const usage = response?.usage;
         if (usage) {
           const promptTokens = usage.prompt_tokens ?? 0;
@@ -781,17 +939,13 @@ export class ObotoAgent {
           totalUsage.completionTokens += completionTokens;
           totalUsage.totalTokens += usageTotal;
 
-          // ── Rate limit: report tokens consumed ──
           this.rateLimiter?.reportTokens(usageTotal);
-
-          // ── Unified usage tracking via bridge (records in both as-agent and lmscript trackers) ──
           this.usageBridge.recordFromLmscript(modelName, {
             promptTokens,
             completionTokens,
             totalTokens: usageTotal,
           });
 
-          // Emit cost update event so consumers can monitor costs in real-time
           if (this.costTracker) {
             this.bus.emit("cost_update", {
               iteration,
@@ -805,6 +959,7 @@ export class ObotoAgent {
         const content = (choice?.message?.content as string) ?? "";
         const toolCalls = choice?.message?.tool_calls;
 
+        // Forward AI reasoning text
         if (content) {
           this.bus.emit("agent_thought", {
             text: content,
@@ -813,14 +968,27 @@ export class ObotoAgent {
           });
         }
 
-        // If no tool calls, this is the final response
+        // ── No tool calls → final response ──
         if (!toolCalls || toolCalls.length === 0) {
+          // Handle empty responses
+          if (!content) {
+            this.bus.emit("agent_thought", {
+              text: `Empty response from AI — iteration ${iteration}`,
+              model: "system",
+            });
+            if (iteration < this.maxIterations) continue;
+          }
+
+          this.emitPhase("memory", "Recording interaction…");
+
           const assistantMsg: ConversationMessage = {
             role: MessageRole.Assistant,
             blocks: [{ kind: "text", text: content }],
           };
           await this.recordMessage(assistantMsg);
           this.bus.emit("state_updated", { reason: "assistant_response" });
+
+          this.emitPhase("complete", "Response ready.");
           this.bus.emit("turn_complete", {
             model: modelName,
             escalated: true,
@@ -829,7 +997,6 @@ export class ObotoAgent {
             usage: totalUsage,
           });
 
-          // ── Middleware: signal completion ──
           await this.middleware.runComplete(syntheticCtx, {
             data: content,
             raw: content,
@@ -838,15 +1005,20 @@ export class ObotoAgent {
           return;
         }
 
-        // Append assistant message (with tool_calls) to conversation
+        // ── Phase: Tools ──
+        this.emitPhase("tools", `Executing ${toolCalls.length} tool(s)…`);
+
         messages.push({
           role: "assistant",
           content: content || null,
           tool_calls: toolCalls,
         });
 
-        // Execute each tool call
-        for (const tc of toolCalls) {
+        // Track tools this round for narrative
+        const roundTools: Array<{ command: string; success: boolean }> = [];
+
+        for (let ti = 0; ti < toolCalls.length; ti++) {
+          const tc = toolCalls[ti];
           if (this.interrupted) break;
 
           let args: Record<string, unknown>;
@@ -869,6 +1041,7 @@ export class ObotoAgent {
                 tool_call_id: tc.id,
                 content: `Permission denied for tool "${command}": ${outcome.reason ?? "denied by policy"}`,
               });
+              roundTools.push({ command, success: false });
               totalToolCalls++;
               continue;
             }
@@ -883,27 +1056,104 @@ export class ObotoAgent {
                 tool_call_id: tc.id,
                 content: `Tool "${command}" blocked by pre-use hook: ${hookResult.messages.join("; ")}`,
               });
+              roundTools.push({ command, success: false });
               totalToolCalls++;
               continue;
             }
           }
 
-          // Detect duplicate tool calls
+          // ── Duplicate detection + doom loop ──
           const callSig = JSON.stringify({ command, kwargs });
           const dupeCount = callHistory.filter((s) => s === callSig).length;
           callHistory.push(callSig);
 
+          // Track consecutive dupes for doom loop detection
+          const prevConsec = consecutiveDupes.get(command) ?? 0;
+          consecutiveDupes.set(command, prevConsec + 1);
+
           if (dupeCount >= 2) {
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: `You already called "${command}" with these arguments ${dupeCount} time(s). Use the data you already have.`,
-            });
+            // ── Doom loop detection ──
+            if (prevConsec >= 3 && !doomLoopRedirected) {
+              doomLoopRedirected = true;
+              this.emitPhase("doom", `Doom loop detected: repeated calls to "${command}"`);
+              this.bus.emit("doom_loop", {
+                reason: `Repeated calls to "${command}"`,
+                command,
+                count: prevConsec + 1,
+                redirected: true,
+              });
+              // Inject a redirect message to break the pattern
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: `STOP: You have been calling "${command}" repeatedly with the same arguments ${prevConsec + 1} times. `
+                  + `This is a doom loop. You MUST take a different approach. `
+                  + `Summarize what you know so far and either try a completely different strategy or provide your best answer.`,
+              });
+            } else if (doomLoopRedirected && prevConsec >= 5) {
+              // Persistent doom loop — force termination
+              this.emitPhase("doom", `Persistent doom loop — terminating.`);
+              this.bus.emit("doom_loop", {
+                reason: `Persistent doom loop on "${command}"`,
+                command,
+                count: prevConsec + 1,
+                redirected: false,
+              });
+              // Break out of the tool loop and the iteration loop
+              roundTools.push({ command, success: false });
+              totalToolCalls++;
+
+              // Emit tool round narrative before breaking
+              if (roundTools.length > 0) {
+                const narrative = this.buildToolRoundNarrative(roundTools);
+                this.bus.emit("tool_round_complete", {
+                  iteration,
+                  tools: roundTools,
+                  totalToolCalls,
+                  narrative,
+                } as ToolRoundEvent);
+              }
+
+              // Force final response
+              this.emitPhase("continuation", "Synthesizing response after doom loop…");
+              const assistantMsg: ConversationMessage = {
+                role: MessageRole.Assistant,
+                blocks: [{ kind: "text", text: content || "I encountered a repeating pattern and am unable to make further progress. Here is what I have so far." }],
+              };
+              await this.recordMessage(assistantMsg);
+              this.bus.emit("state_updated", { reason: "doom_loop" });
+              this.emitPhase("complete", "Response ready.");
+              this.bus.emit("turn_complete", {
+                model: modelName,
+                escalated: true,
+                iterations: iteration,
+                toolCalls: totalToolCalls,
+                usage: totalUsage,
+              });
+              await this.middleware.runComplete(syntheticCtx, {
+                data: content || "doom_loop_terminated",
+                raw: content,
+                usage: totalUsage,
+              } as any);
+              return;
+            } else {
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                content: `You already called "${command}" with these arguments ${dupeCount} time(s). Use the data you already have.`,
+              });
+            }
+
+            roundTools.push({ command, success: false });
             totalToolCalls++;
             continue;
+          } else {
+            // Reset consecutive counter for this command on a novel call
+            consecutiveDupes.set(command, 0);
           }
 
-          this.bus.emit("tool_execution_start", { command, kwargs });
+          // ── Tool status: "Running tool 1/3: read_file" ──
+          this.bus.emit("tool_execution_start", { command, kwargs, index: ti, total: toolCalls.length });
 
           let result: string;
           let isError = false;
@@ -921,13 +1171,13 @@ export class ObotoAgent {
                 `\n\n[... truncated ${resultStr.length - 8000} characters.]`
               : resultStr;
 
-          // ── Post-tool-use hooks ──
           if (this.hookIntegration) {
             this.hookIntegration.runPostToolUse(command, toolInputStr, truncated, isError);
           }
 
-          this.bus.emit("tool_execution_complete", { command, kwargs, result: truncated });
+          this.bus.emit("tool_execution_complete", { command, kwargs, result: truncated, error: isError ? truncated : undefined });
           this.recordToolResult(command, kwargs, truncated);
+          roundTools.push({ command, success: !isError });
           totalToolCalls++;
 
           messages.push({
@@ -936,15 +1186,30 @@ export class ObotoAgent {
             content: truncated,
           });
         }
+
+        // ── Tool round narrative ──
+        if (roundTools.length > 0) {
+          const narrative = this.buildToolRoundNarrative(roundTools);
+          this.bus.emit("tool_round_complete", {
+            iteration,
+            tools: roundTools,
+            totalToolCalls,
+            narrative,
+          } as ToolRoundEvent);
+        }
       }
 
-      // Exhausted iterations fallback
+      // ── Exhausted iterations fallback ──
+      this.emitPhase("continuation", "Maximum iterations reached — synthesizing response…");
+
       const fallbackMsg: ConversationMessage = {
         role: MessageRole.Assistant,
         blocks: [{ kind: "text", text: "I reached the maximum number of iterations. Here is what I have so far." }],
       };
       await this.recordMessage(fallbackMsg);
       this.bus.emit("state_updated", { reason: "max_iterations" });
+
+      this.emitPhase("complete", "Response ready.");
       this.bus.emit("turn_complete", {
         model: modelName,
         escalated: true,
@@ -953,7 +1218,6 @@ export class ObotoAgent {
         usage: totalUsage,
       });
 
-      // ── Middleware: signal completion for max iterations path ──
       await this.middleware.runComplete(syntheticCtx, {
         data: "max_iterations_reached",
         raw: "",
@@ -961,8 +1225,8 @@ export class ObotoAgent {
       } as any);
 
     } catch (err) {
-      // ── Middleware: signal error if not already handled ──
-      // (middleware.runError may have already been called above for LLM errors)
+      this.stopHeartbeat();
+      this.emitPhase("error", `Error: ${err instanceof Error ? err.message : String(err)}`);
       if (!(err instanceof Error && err.message.includes("LLM call failed"))) {
         await this.middleware.runError(
           syntheticCtx,
@@ -970,6 +1234,8 @@ export class ObotoAgent {
         );
       }
       throw err;
+    } finally {
+      this.stopHeartbeat();
     }
   }
 
