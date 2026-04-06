@@ -90,6 +90,9 @@ export class ObotoAgent {
   private usageBridge: UsageBridge;
   private routerEventBridge: RouterEventBridge;
   private currentPhase: AgentPhase = "request";
+  private shouldContinue?: (context: import("./types.js").ContinuationContext) => Promise<boolean>;
+  private continuationBatchSize: number;
+  private maxTotalIterations: number;
 
   constructor(config: ObotoAgentConfig) {
     this.config = config;
@@ -153,6 +156,11 @@ export class ObotoAgent {
     this.systemPrompt = config.systemPrompt ?? "You are a helpful AI assistant with access to tools.";
     this.maxIterations = config.maxIterations ?? 10;
     this.onToken = config.onToken;
+
+    // Adaptive iteration control
+    this.shouldContinue = config.shouldContinue;
+    this.continuationBatchSize = config.continuationBatchSize ?? 10;
+    this.maxTotalIterations = config.maxTotalIterations ?? 100;
 
     this.contextManager = new ContextManager(
       this.localRuntime,
@@ -835,9 +843,11 @@ export class ObotoAgent {
 
     let totalToolCalls = 0;
     const callHistory: string[] = [];
+    const toolsUsedSet = new Set<string>();
     // Track consecutive duplicate patterns for doom loop detection
     const consecutiveDupes = new Map<string, number>();
     let doomLoopRedirected = false;
+    let effectiveMaxIterations = this.maxIterations;
     const turnStartTime = Date.now();
     const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
@@ -851,7 +861,7 @@ export class ObotoAgent {
     await this.middleware.runBeforeExecute(syntheticCtx);
 
     try {
-      for (let iteration = 1; iteration <= this.maxIterations; iteration++) {
+      for (let iteration = 1; iteration <= effectiveMaxIterations; iteration++) {
         if (this.interrupted) {
           this.emitPhase("cancel", "Interrupted by user.");
           break;
@@ -860,7 +870,7 @@ export class ObotoAgent {
         // ── Phase: Thinking with iteration context ──
         this.emitPhase(
           "thinking",
-          `Turn ${iteration}/${this.maxIterations}: ${iteration === 1 ? "Analyzing request…" : "Analyzing results…"}`
+          `Turn ${iteration}/${effectiveMaxIterations}: ${iteration === 1 ? "Analyzing request…" : "Analyzing results…"}`
         );
 
         // ── Budget check ──
@@ -870,10 +880,42 @@ export class ObotoAgent {
 
         await this.rateLimiter?.acquire();
 
-        const isLastIteration = iteration === this.maxIterations;
+        let isLastIteration = iteration === effectiveMaxIterations;
+
+        // ── Adaptive continuation: ask shouldContinue before hitting the wall ──
+        if (isLastIteration && this.shouldContinue && effectiveMaxIterations < this.maxTotalIterations) {
+          const lastContent = messages.filter(m => m.role === "assistant").pop()?.content;
+          try {
+            const shouldGo = await this.shouldContinue({
+              currentIteration: iteration,
+              currentLimit: effectiveMaxIterations,
+              totalToolCalls,
+              uniqueToolsUsed: toolsUsedSet.size,
+              toolsUsed: [...toolsUsedSet],
+              doomDetected: doomLoopRedirected,
+              lastContent: typeof lastContent === "string" ? lastContent : "",
+              usage: { ...totalUsage },
+            });
+            if (shouldGo) {
+              const extension = Math.min(
+                this.continuationBatchSize,
+                this.maxTotalIterations - effectiveMaxIterations,
+              );
+              effectiveMaxIterations += extension;
+              isLastIteration = false;
+              this.emitPhase(
+                "continuation",
+                `Extending: ${extension} more iterations granted (${effectiveMaxIterations} total)`
+              );
+            }
+          } catch (err) {
+            // shouldContinue failure is non-fatal — proceed with hard stop
+            console.warn("[ObotoAgent] shouldContinue callback failed:", err);
+          }
+        }
 
         if (isLastIteration) {
-          this.emitPhase("continuation", "Maximum iterations reached — synthesizing final response…");
+          this.emitPhase("continuation", "Final iteration — synthesizing response…");
           messages.push({
             role: "user",
             content:
@@ -1151,6 +1193,7 @@ export class ObotoAgent {
           this.recordToolResult(command, kwargs, truncated);
           roundTools.push({ command, success: !isError, kwargs });
           totalToolCalls++;
+          toolsUsedSet.add(command);
 
           messages.push({
             role: "tool",
@@ -1172,11 +1215,27 @@ export class ObotoAgent {
       }
 
       // ── Exhausted iterations fallback ──
-      this.emitPhase("continuation", "Maximum iterations reached — synthesizing response…");
+      // If we reach here, the for-loop completed without the LLM producing
+      // a final tool-free response.  The last iteration already injected
+      // a "provide your final response" prompt, so the LLM *should* have
+      // answered — but if it didn't, record what we have.
+      this.emitPhase("continuation", "All iterations used — finalizing…");
+
+      // Grab the last assistant content from messages as the fallback
+      let fallbackText = "";
+      for (let i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === "assistant" && typeof messages[i].content === "string" && messages[i].content) {
+          fallbackText = messages[i].content as string;
+          break;
+        }
+      }
+      if (!fallbackText) {
+        fallbackText = "I wasn't able to complete the task within the available iterations. Please let me know how you'd like to proceed.";
+      }
 
       const fallbackMsg: ConversationMessage = {
         role: MessageRole.Assistant,
-        blocks: [{ kind: "text", text: "I reached the maximum number of iterations. Here is what I have so far." }],
+        blocks: [{ kind: "text", text: fallbackText }],
       };
       await this.recordMessage(fallbackMsg);
       this.bus.emit("state_updated", { reason: "max_iterations" });
@@ -1185,7 +1244,7 @@ export class ObotoAgent {
       this.bus.emit("turn_complete", {
         model: modelName,
         escalated: true,
-        iterations: this.maxIterations,
+        iterations: effectiveMaxIterations,
         toolCalls: totalToolCalls,
         usage: totalUsage,
       });

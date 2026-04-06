@@ -15,6 +15,7 @@ export type {
   PhaseEvent,
   DoomLoopEvent,
   ToolRoundEvent,
+  ContinuationContext,
 } from "./types.js";
 
 // Event bus

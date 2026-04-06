@@ -101,6 +101,43 @@ export interface ObotoAgentConfig {
   hookRunner?: HookRunner;
   /** as-agent Wasm runtime for slash commands and utilities */
   agentRuntime?: AgentRuntime;
+
+  // ── Adaptive iteration control ─────────────────────────────────
+
+  /**
+   * Called when the agent reaches maxIterations. Return true to grant
+   * more iterations, false to stop. Receives a summary of progress so
+   * the caller (e.g. a support LLM) can decide intelligently.
+   *
+   * If not provided, the agent uses a hard stop at maxIterations.
+   * When granted, iterations are extended by `continuationBatchSize`
+   * (default 10), up to `maxTotalIterations` (default 100).
+   */
+  shouldContinue?: (context: ContinuationContext) => Promise<boolean>;
+  /** How many extra iterations to grant per continuation. Default: 10 */
+  continuationBatchSize?: number;
+  /** Absolute ceiling on total iterations regardless of shouldContinue. Default: 100 */
+  maxTotalIterations?: number;
+}
+
+/** Context passed to the shouldContinue callback */
+export interface ContinuationContext {
+  /** Current iteration number (1-based) */
+  currentIteration: number;
+  /** Current maxIterations limit */
+  currentLimit: number;
+  /** Total tool calls made so far */
+  totalToolCalls: number;
+  /** Number of unique tools used */
+  uniqueToolsUsed: number;
+  /** List of tool names used this turn */
+  toolsUsed: string[];
+  /** Whether a doom loop was detected */
+  doomDetected: boolean;
+  /** The most recent AI text content (if any) */
+  lastContent: string;
+  /** Token usage so far */
+  usage: { promptTokens: number; completionTokens: number; totalTokens: number };
 }
 
 // ── Event Bus ──────────────────────────────────────────────────────

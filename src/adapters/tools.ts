@@ -33,7 +33,8 @@ export function createRouterTool(
     description: schema.description,
     parameters: RouterToolParams,
     execute: async (params) => {
-      return router.execute(params.command, params.kwargs ?? {});
+      const cmd = typeof params.command === "string" ? params.command : "";
+      return router.execute(cmd, params.kwargs ?? {});
     },
   };
 }
