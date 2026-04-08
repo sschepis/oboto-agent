@@ -723,6 +723,18 @@ export class ObotoAgent {
         totalToolCalls++;
 
         this.recordToolResult(String(command), kwargs as Record<string, unknown>, resultStr);
+
+        // Persist tool interactions in session + contextManager for cross-turn memory.
+        // onToolCall may be synchronous in lmscript's API, so use fire-and-forget.
+        const toolCallId = `call_${Date.now()}_${totalToolCalls}`;
+        this.recordMessage({
+          role: MessageRole.Assistant,
+          blocks: [{ kind: "tool_use", id: toolCallId, name: String(command), input: JSON.stringify(kwargs).substring(0, 500) }],
+        }).catch(() => {});
+        this.recordMessage({
+          role: MessageRole.Tool,
+          blocks: [{ kind: "tool_result", toolUseId: toolCallId, toolName: String(command), output: resultStr.substring(0, 2000), isError }],
+        }).catch(() => {});
       },
       onIteration: (iteration: number, response: string) => {
         // Emit tool round narrative if tools were called this iteration
@@ -1028,6 +1040,28 @@ export class ObotoAgent {
           tool_calls: toolCalls,
         });
 
+        // Persist assistant tool-calling intent in session + contextManager
+        // so it survives across turns (the local `messages` array is ephemeral).
+        const toolBlocks: import("@sschepis/as-agent").ContentBlock[] = [];
+        if (content) {
+          toolBlocks.push({ kind: "text", text: content });
+        }
+        for (const tc of toolCalls) {
+          let parsedTcArgs: Record<string, unknown> = {};
+          try { parsedTcArgs = JSON.parse(tc.function.arguments); } catch {}
+          const tcCommand = (parsedTcArgs.command as string) ?? tc.function.name;
+          toolBlocks.push({
+            kind: "tool_use",
+            id: tc.id,
+            name: tcCommand,
+            input: tc.function.arguments?.substring(0, 500) || "{}",
+          });
+        }
+        await this.recordMessage({
+          role: MessageRole.Assistant,
+          blocks: toolBlocks,
+        });
+
         // Track tools this round for narrative
         const roundTools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown> }> = [];
 
@@ -1199,6 +1233,18 @@ export class ObotoAgent {
             role: "tool",
             tool_call_id: tc.id,
             content: truncated,
+          });
+
+          // Persist tool result in session + contextManager for cross-turn memory
+          await this.recordMessage({
+            role: MessageRole.Tool,
+            blocks: [{
+              kind: "tool_result",
+              toolUseId: tc.id,
+              toolName: command,
+              output: truncated.substring(0, 2000),
+              isError,
+            }],
           });
         }
 
