@@ -74,6 +74,7 @@ export class ObotoAgent {
   private interrupted = false;
   private systemPrompt: string;
   private maxIterations: number;
+  private maxOutputTokens: number;
   private config: ObotoAgentConfig;
   private onToken?: (token: string) => void;
   private costTracker: CostTracker;
@@ -155,6 +156,7 @@ export class ObotoAgent {
     this.session = config.session ?? createEmptySession();
     this.systemPrompt = config.systemPrompt ?? "You are a helpful AI assistant with access to tools.";
     this.maxIterations = config.maxIterations ?? 10;
+    this.maxOutputTokens = config.maxOutputTokens ?? 16384;
     this.onToken = config.onToken;
 
     // Adaptive iteration control
@@ -455,6 +457,38 @@ export class ObotoAgent {
    * Uses both command name and kwargs to produce accurate descriptions.
    * E.g. "Just read file data, and edited files. Sending results back to AI for next steps…"
    */
+
+  /**
+   * Parse tool calls embedded as text by models that don't use native function
+   * calling. Matches patterns like: [Tool call: command({"command":"x","kwargs":{...}})]
+   * or [Tool call: terminal_interface({"command":"x","kwargs":{...}})]
+   */
+  private parseTextToolCalls(content: string): Array<{
+    id: string; type: "function"; function: { name: string; arguments: string };
+  }> {
+    const results: Array<{
+      id: string; type: "function"; function: { name: string; arguments: string };
+    }> = [];
+
+    const re = /\[Tool call:\s*([A-Za-z0-9_/]+)\((\{[\s\S]*?\})\)\]/g;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(content)) !== null) {
+      const toolName = match[1];
+      const argsStr = match[2];
+      try {
+        JSON.parse(argsStr);
+        results.push({
+          id: `text_tc_${Date.now()}_${results.length}`,
+          type: "function",
+          function: { name: toolName, arguments: argsStr },
+        });
+      } catch {
+        // Malformed JSON — skip
+      }
+    }
+    return results;
+  }
+
   private buildToolRoundNarrative(
     tools: Array<{ command: string; success: boolean; kwargs?: Record<string, unknown> }>
   ): string {
@@ -939,6 +973,7 @@ export class ObotoAgent {
           model: modelName,
           messages: [...messages],
           temperature: 0.7,
+          max_tokens: this.maxOutputTokens,
           ...(isLastIteration
             ? {}
             : { tools, tool_choice: "auto" as const }),
@@ -983,15 +1018,27 @@ export class ObotoAgent {
 
         const choice = response?.choices?.[0];
         const content = (choice?.message?.content as string) ?? "";
-        const toolCalls = choice?.message?.tool_calls;
+        let toolCalls = choice?.message?.tool_calls;
 
-        // Forward AI reasoning text
+        // Fallback: if the model emitted tool calls as text instead of using
+        // native function calling, parse them out and synthesize tool_calls.
+        if ((!toolCalls || toolCalls.length === 0) && content) {
+          const parsed = this.parseTextToolCalls(content);
+          if (parsed.length > 0) {
+            toolCalls = parsed;
+          }
+        }
+
+        // Forward AI reasoning text (strip tool call text from display)
         if (content) {
-          this.bus.emit("agent_thought", {
-            text: content,
-            model: modelName,
-            iteration,
-          });
+          const displayContent = content.replace(/\[Tool call:[\s\S]*?(?:\)\]|$)/g, '').trim();
+          if (displayContent) {
+            this.bus.emit("agent_thought", {
+              text: displayContent,
+              model: modelName,
+              iteration,
+            });
+          }
         }
 
         // ── No tool calls → final response ──
@@ -1087,6 +1134,7 @@ export class ObotoAgent {
               messages.push({
                 role: "tool",
                 tool_call_id: tc.id,
+                name: tc.function.name,
                 content: `Permission denied for tool "${command}": ${outcome.reason ?? "denied by policy"}`,
               });
               roundTools.push({ command, success: false });
@@ -1102,6 +1150,7 @@ export class ObotoAgent {
               messages.push({
                 role: "tool",
                 tool_call_id: tc.id,
+                name: tc.function.name,
                 content: `Tool "${command}" blocked by pre-use hook: ${hookResult.messages.join("; ")}`,
               });
               roundTools.push({ command, success: false });
@@ -1134,6 +1183,7 @@ export class ObotoAgent {
               messages.push({
                 role: "tool",
                 tool_call_id: tc.id,
+                name: tc.function.name,
                 content: `STOP: You have been calling "${command}" repeatedly with the same arguments ${prevConsec + 1} times. `
                   + `This is a doom loop. You MUST take a different approach. `
                   + `Summarize what you know so far and either try a completely different strategy or provide your best answer.`,
@@ -1188,6 +1238,7 @@ export class ObotoAgent {
               messages.push({
                 role: "tool",
                 tool_call_id: tc.id,
+                name: tc.function.name,
                 content: `You already called "${command}" with these arguments ${dupeCount} time(s). Use the data you already have.`,
               });
             }
@@ -1232,6 +1283,7 @@ export class ObotoAgent {
           messages.push({
             role: "tool",
             tool_call_id: tc.id,
+            name: tc.function.name,
             content: truncated,
           });
 
@@ -1325,6 +1377,9 @@ export class ObotoAgent {
 
     const chunks: StandardChatChunk[] = [];
     for await (const chunk of stream) {
+      if (this.interrupted) {
+        throw new Error("Generation interrupted by user");
+      }
       chunks.push(chunk);
 
       const delta = chunk.choices?.[0]?.delta;
