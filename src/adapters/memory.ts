@@ -39,9 +39,30 @@ function blocksToText(blocks: AsContentBlock[]): string {
 
 /** Convert an as-agent ConversationMessage to an lmscript ChatMessage. */
 export function toChat(msg: ConversationMessage): ChatMessage {
+  const hasImage = (msg.blocks as any[]).some((b) => b.kind === "image");
+  if (!hasImage) {
+    return {
+      role: ROLE_TO_STRING[msg.role] ?? "user",
+      content: blocksToText(msg.blocks),
+    };
+  }
+
+  const contentParts: Array<{ type: string; text?: string; image_url?: { url: string } }> = [];
+  for (const b of msg.blocks as any[]) {
+    if (b.kind === "text") {
+      contentParts.push({ type: "text", text: b.text });
+    } else if (b.kind === "image") {
+      contentParts.push({ type: "image_url", image_url: { url: b.url } });
+    } else if (b.kind === "tool_use") {
+      contentParts.push({ type: "text", text: `[Tool call: ${b.name}(${b.input})]` });
+    } else if (b.kind === "tool_result") {
+      contentParts.push({ type: "text", text: b.isError ? `[Tool error (${b.toolName}): ${b.output}]` : `[Tool result (${b.toolName}): ${b.output}]` });
+    }
+  }
+
   return {
     role: ROLE_TO_STRING[msg.role] ?? "user",
-    content: blocksToText(msg.blocks),
+    content: contentParts as any,
   };
 }
 

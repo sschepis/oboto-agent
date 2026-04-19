@@ -45,6 +45,8 @@ export interface ObotoAgentConfig {
   maxContextTokens?: number;
   /** Maximum LLM iterations per turn. Default: 10 */
   maxIterations?: number;
+  /** Maximum output tokens per LLM call. Prevents truncated tool calls on models with low defaults (e.g. Gemini). Default: 16384 */
+  maxOutputTokens?: number;
   /** System prompt prepended to all LLM calls */
   systemPrompt?: string;
   /** Called with each token chunk during LLM streaming. Enables real-time output. */

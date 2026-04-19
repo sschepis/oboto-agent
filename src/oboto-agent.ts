@@ -259,7 +259,7 @@ export class ObotoAgent {
   }
 
   /** Submit user input to the agent. Triggers the execution loop. */
-  async submitInput(text: string): Promise<void> {
+  async submitInput(text: string, attachments?: any[]): Promise<void> {
     if (this.isProcessing) {
       this.interrupt(text);
       return;
@@ -285,7 +285,7 @@ export class ObotoAgent {
     this.interrupted = false;
 
     try {
-      await this.executionLoop(text);
+      await this.executionLoop(text, attachments);
 
       // End the usage tracker turn (via bridge)
       this.usageBridge.endTurn();
@@ -583,16 +583,27 @@ export class ObotoAgent {
     }
   }
 
-  private async executionLoop(userInput: string): Promise<void> {
+  private async executionLoop(userInput: string, attachments?: any[]): Promise<void> {
     // ── Phase: Request ──
     this.emitPhase("request", `Processing: ${userInput.substring(0, 80)}${userInput.length > 80 ? "…" : ""}`);
 
     // 1. Emit user_input and record in session + context + RAG
     this.bus.emit("user_input", { text: userInput });
 
+    const blocks: any[] = [{ kind: "text", text: userInput }];
+    if (attachments && attachments.length > 0) {
+      for (const att of attachments) {
+        if (att.type === "image" && att.url) {
+          blocks.push({ kind: "image", url: att.url });
+        } else if (att.type === "text" && att.content) {
+          blocks.push({ kind: "text", text: `\n\n--- Attachment: ${att.name} ---\n${att.content}\n--- End Attachment ---` });
+        }
+      }
+    }
+
     const userMsg: ConversationMessage = {
       role: MessageRole.User,
-      blocks: [{ kind: "text", text: userInput }],
+      blocks: blocks as any,
     };
     await this.recordMessage(userMsg);
     this.bus.emit("state_updated", { reason: "user_input" });
