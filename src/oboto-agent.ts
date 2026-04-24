@@ -476,17 +476,44 @@ export class ObotoAgent {
       const toolName = match[1];
       const argsStr = match[2];
       try {
-        JSON.parse(argsStr);
+        const parsed = JSON.parse(argsStr);
+        let normalized: Record<string, unknown>;
+        if (typeof parsed.command === 'string') {
+          normalized = parsed;
+        } else {
+          normalized = {
+            command: toolName.replace(/_/g, ' '),
+            kwargs: parsed,
+          };
+        }
         results.push({
           id: `text_tc_${Date.now()}_${results.length}`,
           type: "function",
-          function: { name: toolName, arguments: argsStr },
+          function: {
+            name: this.routerTool.name,
+            arguments: JSON.stringify(normalized),
+          },
         });
       } catch {
         // Malformed JSON — skip
       }
     }
     return results;
+  }
+
+  private normalizeToolArgs(
+    raw: Record<string, unknown>,
+    fallbackCommand: string
+  ): Record<string, unknown> {
+    const command = typeof raw.command === 'string' ? raw.command : fallbackCommand;
+    let kwargs: Record<string, unknown>;
+    if (raw.kwargs != null && typeof raw.kwargs === 'object' && !Array.isArray(raw.kwargs)) {
+      kwargs = raw.kwargs as Record<string, unknown>;
+    } else {
+      const { command: _cmd, kwargs: _kw, ...rest } = raw;
+      kwargs = Object.keys(rest).length > 0 ? rest : {};
+    }
+    return { command, kwargs };
   }
 
   private buildToolRoundNarrative(
@@ -739,7 +766,7 @@ export class ObotoAgent {
         reasoning: z.string().optional().describe("Internal reasoning about the approach taken"),
       }),
       tools: [this.routerTool],
-      temperature: 0.7,
+      // temperature omitted — some providers (e.g. Anthropic Claude 4.x) reject it
       maxRetries: 1,
     };
 
@@ -904,6 +931,7 @@ export class ObotoAgent {
     // Track consecutive duplicate patterns for doom loop detection
     const consecutiveDupes = new Map<string, number>();
     let doomLoopRedirected = false;
+    let consecutiveEmpties = 0;
     let effectiveMaxIterations = this.maxIterations;
     const turnStartTime = Date.now();
     const totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
@@ -983,7 +1011,7 @@ export class ObotoAgent {
         const params: import("@sschepis/llm-wrapper").StandardChatParams = {
           model: modelName,
           messages: [...messages],
-          temperature: 0.7,
+          // temperature omitted — some providers (e.g. Anthropic Claude 4.x) reject it
           max_tokens: this.maxOutputTokens,
           ...(isLastIteration
             ? {}
@@ -1054,13 +1082,17 @@ export class ObotoAgent {
 
         // ── No tool calls → final response ──
         if (!toolCalls || toolCalls.length === 0) {
-          // Handle empty responses
+          // Handle empty responses — bail after 3 consecutive empties since
+          // nothing changes between iterations and the model will keep looping.
           if (!content) {
+            consecutiveEmpties++;
             this.bus.emit("agent_thought", {
               text: `Empty response from AI — iteration ${iteration}`,
               model: "system",
             });
-            if (iteration < this.maxIterations) continue;
+            if (consecutiveEmpties < 3 && iteration < effectiveMaxIterations) continue;
+          } else {
+            consecutiveEmpties = 0;
           }
 
           this.emitPhase("memory", "Recording interaction…");
@@ -1134,8 +1166,16 @@ export class ObotoAgent {
             args = {};
           }
 
-          const command = (args.command as string) ?? tc.function.name;
-          const kwargs = (args.kwargs as Record<string, unknown>) ?? {};
+          // Validate through Zod schema (same as AgentLoop path), with normalization fallback
+          let validatedArgs: Record<string, unknown>;
+          try {
+            validatedArgs = tool.parameters.parse(args);
+          } catch {
+            validatedArgs = this.normalizeToolArgs(args, tc.function.name);
+          }
+
+          const command = (validatedArgs.command as string) ?? tc.function.name;
+          const kwargs = (validatedArgs.kwargs as Record<string, unknown>) ?? {};
           const toolInputStr = JSON.stringify({ command, kwargs });
 
           // ── Permission check ──
@@ -1212,6 +1252,23 @@ export class ObotoAgent {
               roundTools.push({ command, success: false });
               totalToolCalls++;
 
+              // Backfill tool_results for remaining unanswered tool_calls
+              const answeredIds = new Set(
+                messages
+                  .filter((m: any) => m.role === "tool" && m.tool_call_id)
+                  .map((m: any) => m.tool_call_id),
+              );
+              for (const remainingTc of toolCalls!) {
+                if (!answeredIds.has(remainingTc.id)) {
+                  messages.push({
+                    role: "tool",
+                    tool_call_id: remainingTc.id,
+                    name: remainingTc.function.name,
+                    content: "Tool execution was cancelled due to doom loop.",
+                  });
+                }
+              }
+
               // Emit tool round narrative before breaking
               if (roundTools.length > 0) {
                 const narrative = this.buildToolRoundNarrative(roundTools);
@@ -1268,7 +1325,7 @@ export class ObotoAgent {
           let result: string;
           let isError = false;
           try {
-            result = await tool.execute(args);
+            result = await tool.execute(validatedArgs);
           } catch (err) {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
             isError = true;
@@ -1309,6 +1366,27 @@ export class ObotoAgent {
               isError,
             }],
           });
+        }
+
+        // Backfill tool_results for any tool_calls that were skipped (e.g. due
+        // to interruption or early exit).  The API requires every tool_use to
+        // have a matching tool_result in the immediately following message.
+        if (toolCalls) {
+          const answeredIds = new Set(
+            messages
+              .filter((m: any) => m.role === "tool" && m.tool_call_id)
+              .map((m: any) => m.tool_call_id),
+          );
+          for (const tc of toolCalls) {
+            if (!answeredIds.has(tc.id)) {
+              messages.push({
+                role: "tool",
+                tool_call_id: tc.id,
+                name: tc.function.name,
+                content: "Tool execution was cancelled.",
+              });
+            }
+          }
         }
 
         // ── Tool round narrative ──

@@ -34,7 +34,10 @@ export function createRouterTool(
     parameters: RouterToolParams,
     execute: async (params) => {
       const cmd = typeof params.command === "string" ? params.command : "";
-      return router.execute(cmd, params.kwargs ?? {});
+      const kw = (params.kwargs != null && typeof params.kwargs === 'object')
+        ? params.kwargs
+        : {};
+      return router.execute(cmd, kw);
     },
   };
 }
