@@ -19,8 +19,8 @@ importers:
         specifier: ^0.1.2
         version: 0.1.2
       '@sschepis/llm-wrapper':
-        specifier: ^0.1.1
-        version: 0.1.1
+        specifier: ^0.3.1
+        version: 0.3.1
       '@sschepis/lmscript':
         specifier: ^0.1.3
         version: 0.1.3(zod@3.25.76)
@@ -515,20 +515,20 @@ packages:
     resolution: {integrity: sha512-9ge6Tvee7x33awDM3fVoYhG9cZJZFByT+Xr0L9TIu7ao4pzkn40H0r+QhRi4fchqzYF4FM8txOc6YXvb/IsbJg==}
     engines: {node: '>=18.0.0'}
 
-  '@sschepis/llm-wrapper@0.1.1':
-    resolution: {integrity: sha512-xETt7GC2S6l7a5thtFMBormHzk9M6JoDfx7dzLOY80tcz3krDoRbQo8vCrUreWDsp4Wx/dcgjAVIYfcXCU+/OA==}
+  '@sschepis/llm-wrapper@0.3.1':
+    resolution: {integrity: sha512-tRJUGFCm8f27zQs+Ia27ejDavpN/L1sYaU201y7Pup/5bSM0NyYLeQ9/v009CJxo/X2HtUvChIVMa65AQ2aMFQ==}
     engines: {node: '>=18.0.0'}
     peerDependencies:
       '@anthropic-ai/sdk': ^0.30.0
       '@google-cloud/vertexai': ^1.9.0
-      '@google/generative-ai': ^0.21.0
+      '@google/genai': ^1.0.0
       openai: ^4.0.0
     peerDependenciesMeta:
       '@anthropic-ai/sdk':
         optional: true
       '@google-cloud/vertexai':
         optional: true
-      '@google/generative-ai':
+      '@google/genai':
         optional: true
       openai:
         optional: true
@@ -1187,7 +1187,7 @@ snapshots:
 
   '@sschepis/as-agent@0.1.2': {}
 
-  '@sschepis/llm-wrapper@0.1.1':
+  '@sschepis/llm-wrapper@0.3.1':
     dependencies:
       zod: 3.25.76
 
