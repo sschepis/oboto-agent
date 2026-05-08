@@ -156,27 +156,32 @@ export class SessionCompactor {
     const toSummarize = session.messages.slice(0, totalMessages - preserve);
     const toPreserve = session.messages.slice(totalMessages - preserve);
 
-    // Build a summary from the messages being removed
+    // Build a structured bullet-point summary from the messages being removed
     const summaryParts: string[] = [];
     for (const msg of toSummarize) {
       const role = roleToString(msg.role);
-      const text = blocksToText(msg.blocks);
-      if (text.trim()) {
-        summaryParts.push(`[${role}]: ${text}`);
+      for (const b of msg.blocks) {
+        if (b.kind === "text" && b.text.trim()) {
+          const preview = b.text.trim().slice(0, 100).replace(/\n/g, " ");
+          summaryParts.push(`- [${role}]: ${preview}${b.text.length > 100 ? "…" : ""}`);
+        } else if (b.kind === "tool_use") {
+          summaryParts.push(`- [${role}] called ${b.name}`);
+        } else if (b.kind === "tool_result") {
+          const preview = (b.output ?? "").slice(0, 60).replace(/\n/g, " ");
+          summaryParts.push(`- [tool] ${b.toolName}: ${preview}${(b.output ?? "").length > 60 ? "…" : ""}`);
+        }
       }
     }
 
-    const summary = summaryParts.join("\n\n");
+    const summary = summaryParts.join("\n");
     const formattedSummary = `[Session Compaction Summary — ${toSummarize.length} messages summarized]\n\n${summary}`;
 
-    // Build the compacted session with a summary message + preserved messages
+    const truncatedSummary = summary.length > 2000 ? summary.slice(0, 2000) + "\n[... summary truncated]" : summary;
     const summaryMessage: ConversationMessage = {
       role: MessageRole.System,
       blocks: [{
         kind: "text",
-        text: `[Previous conversation summary — ${toSummarize.length} messages compacted]\n\n${
-          summary.length > 4000 ? summary.slice(0, 4000) + "\n\n[... summary truncated]" : summary
-        }`,
+        text: `[Previous conversation — ${toSummarize.length} messages compacted]\n${truncatedSummary}`,
       }],
     };
 

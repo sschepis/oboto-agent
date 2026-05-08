@@ -26,7 +26,8 @@ export function createRouterTool(
   router: Router,
   root?: BranchNode
 ): ToolDefinition<typeof RouterToolParams, string> {
-  const schema = generateToolSchema({ root });
+  const effectiveRoot = root ?? (router as any).root as BranchNode | undefined;
+  const schema = generateToolSchema({ root: effectiveRoot });
 
   return {
     name: schema.name,

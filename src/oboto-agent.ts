@@ -90,6 +90,7 @@ export class ObotoAgent {
   private usageTracker: AgentUsageTracker;
   private usageBridge: UsageBridge;
   private routerEventBridge: RouterEventBridge;
+  private triageToolSummary: string;
   private currentPhase: AgentPhase = "request";
   private shouldContinue?: (context: import("./types.js").ContinuationContext) => Promise<boolean>;
   private continuationBatchSize: number;
@@ -181,6 +182,16 @@ export class ObotoAgent {
     this.routerTool = createRouterTool(config.router);
     this.triageFn = createTriageFunction(config.localModelName);
 
+    // Build a short summary for triage — just the module names, not full descriptions
+    const descLines = this.routerTool.description.split("\n");
+    const moduleLines = descLines
+      .filter(l => l.trim().startsWith("-") || l.trim().match(/^\w+\//))
+      .map(l => l.trim())
+      .slice(0, 20);
+    this.triageToolSummary = moduleLines.length > 0
+      ? "Available tool modules: " + moduleLines.join(", ")
+      : "The agent has tools for file operations, code intelligence, search, shell, git, web, and more.";
+
     // ── RAG pipeline (optional) ─────────────────────────────────────
     if (config.embeddingProvider) {
       this.conversationRAG = new ConversationRAG(this.remoteRuntime, {
@@ -232,12 +243,6 @@ export class ObotoAgent {
     if (isLLMRouter(config.remoteModel)) {
       this.routerEventBridge.attach(config.remoteModel, "remote");
     }
-
-    // Push system prompt into context
-    this.contextManager.push({
-      role: "system",
-      content: this.systemPrompt,
-    });
 
     // Seed context manager from existing session messages so triage
     // and execution paths see the full conversation history.
@@ -643,14 +648,25 @@ export class ObotoAgent {
       try {
         const { context } = await this.conversationRAG.retrieve(userInput);
         if (context) {
-          await this.contextManager.push({
-            role: "system",
-            content: context,
-          });
-          this.bus.emit("agent_thought", {
-            text: "Retrieved relevant past context via RAG.",
-            model: "system",
-          });
+          // Check overlap with recent messages to avoid duplicating context
+          const recentMsgs = this.contextManager.getMessages().slice(-10);
+          const recentText = recentMsgs
+            .map(m => typeof m.content === "string" ? m.content : "")
+            .join(" ");
+          const ragSentences = context.split(/[.!?\n]+/).filter(s => s.trim().length > 20);
+          const overlapCount = ragSentences.filter(s => recentText.includes(s.trim())).length;
+          const overlapRatio = ragSentences.length > 0 ? overlapCount / ragSentences.length : 0;
+
+          if (overlapRatio < 0.5) {
+            await this.contextManager.push({
+              role: "system",
+              content: context,
+            });
+            this.bus.emit("agent_thought", {
+              text: "Retrieved relevant past context via RAG.",
+              model: "system",
+            });
+          }
         }
       } catch (err) {
         console.warn("[ObotoAgent] RAG retrieval failed:", err instanceof Error ? err.message : err);
@@ -719,7 +735,7 @@ export class ObotoAgent {
     const result = await this.localRuntime.execute(this.triageFn, {
       userInput,
       recentContext,
-      availableTools: this.routerTool.description,
+      availableTools: this.triageToolSummary,
     });
 
     return result.data;
@@ -749,7 +765,7 @@ export class ObotoAgent {
       name: "agent-task",
       model: modelName,
       system: this.systemPrompt,
-      prompt: (input: string) => {
+      prompt: (_input: string) => {
         const contextMessages = this.contextManager.getMessages();
         const contextStr = contextMessages
           .filter(m => m.role !== "system")
@@ -759,7 +775,7 @@ export class ObotoAgent {
           })
           .join("\n");
 
-        return contextStr ? `${contextStr}\n\nuser: ${input}` : input;
+        return contextStr || _input;
       },
       schema: z.object({
         response: z.string().describe("The assistant's response to the user"),
@@ -899,16 +915,19 @@ export class ObotoAgent {
 
     const contextMessages = this.contextManager.getMessages();
 
-    const messages: import("@sschepis/llm-wrapper").Message[] = contextMessages.map((m) => ({
-      role: m.role,
-      content:
-        typeof m.content === "string"
-          ? m.content
-          : (m.content as Array<{ type: string; text?: string }>)
-              .filter((b) => b.type === "text")
-              .map((b) => b.text ?? "")
-              .join("\n"),
-    }));
+    const messages: import("@sschepis/llm-wrapper").Message[] = [
+      { role: "system", content: this.systemPrompt },
+      ...contextMessages.map((m) => ({
+        role: m.role,
+        content:
+          typeof m.content === "string"
+            ? m.content
+            : (m.content as Array<{ type: string; text?: string }>)
+                .filter((b) => b.type === "text")
+                .map((b) => b.text ?? "")
+                .join("\n"),
+      })),
+    ];
 
     const tool = this.routerTool;
     const parametersSchema = tool.parameters
@@ -925,6 +944,7 @@ export class ObotoAgent {
       },
     ];
 
+    const initialContextLength = messages.length;
     let totalToolCalls = 0;
     const callHistory: string[] = [];
     const toolsUsedSet = new Set<string>();
@@ -950,6 +970,11 @@ export class ObotoAgent {
         if (this.interrupted) {
           this.emitPhase("cancel", "Interrupted by user.");
           break;
+        }
+
+        // Prune old tool results to save tokens on subsequent iterations
+        if (iteration > 3) {
+          this.pruneIntraTurnMessages(messages, initialContextLength, 3);
         }
 
         // ── Phase: Thinking with iteration context ──
@@ -1451,6 +1476,39 @@ export class ObotoAgent {
         );
       }
       throw err;
+    }
+  }
+
+  /**
+   * Prune old tool results in the messages array to reduce token usage.
+   * Keeps the initial context messages and the last `keepIterations` worth
+   * of tool exchanges in full; older tool results are replaced with summaries.
+   */
+  private pruneIntraTurnMessages(
+    messages: import("@sschepis/llm-wrapper").Message[],
+    initialContextLength: number,
+    keepIterations: number
+  ): void {
+    // Find boundaries of iteration blocks (assistant + tool result groups)
+    const iterationStarts: number[] = [];
+    for (let i = initialContextLength; i < messages.length; i++) {
+      if (messages[i].role === "assistant") {
+        iterationStarts.push(i);
+      }
+    }
+
+    if (iterationStarts.length <= keepIterations) return;
+
+    const cutoff = iterationStarts[iterationStarts.length - keepIterations];
+
+    for (let i = initialContextLength; i < cutoff; i++) {
+      const msg = messages[i];
+      if (msg.role === "tool" && typeof msg.content === "string"
+          && msg.content.length > 150 && !msg.content.startsWith("[Prior result from ")) {
+        const name = (msg as any).name ?? "tool";
+        const preview = msg.content.slice(0, 80).replace(/\n/g, " ");
+        msg.content = `[Prior result from ${name}: ${preview}... (${msg.content.length} chars)]`;
+      }
     }
   }
 
