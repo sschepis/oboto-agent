@@ -84,7 +84,10 @@ export function toLmscriptProvider(
       const params = buildParams(request, tools);
 
       const response = await provider.chat(params);
-      const choice = response.choices[0];
+      const choice = response.choices?.[0];
+      if (!choice) {
+        return { content: "", usage: undefined, toolCalls: undefined };
+      }
 
       // Convert tool calls back to lmscript format
       let toolCalls: LLMResponse["toolCalls"];

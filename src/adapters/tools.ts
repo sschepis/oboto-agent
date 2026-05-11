@@ -14,7 +14,7 @@ const RouterToolParams = z.object({
     .optional()
     .default({})
     .describe("Key-value arguments for the command"),
-});
+}).passthrough();
 
 /**
  * Bridge a swiss-army-tool Router into an lmscript ToolDefinition.
@@ -35,9 +35,15 @@ export function createRouterTool(
     parameters: RouterToolParams,
     execute: async (params) => {
       const cmd = typeof params.command === "string" ? params.command : "";
-      const kw = (params.kwargs != null && typeof params.kwargs === 'object')
+      let kw = (params.kwargs != null && typeof params.kwargs === 'object' && !Array.isArray(params.kwargs))
         ? params.kwargs
         : {};
+      // LLMs sometimes send tool args at the top level instead of nested in kwargs.
+      // Merge any extra top-level keys into kwargs so they reach the handler.
+      const { command: _c, kwargs: _k, ...rest } = params as Record<string, unknown>;
+      if (Object.keys(rest).length > 0 && Object.keys(kw).length === 0) {
+        kw = rest;
+      }
       return router.execute(cmd, kw);
     },
   };

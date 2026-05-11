@@ -42,7 +42,11 @@ export class AgentEventBus {
     const handlers = this.listeners.get(type);
     if (handlers) {
       for (const handler of handlers) {
-        handler(event);
+        try {
+          handler(event);
+        } catch (err) {
+          console.error(`[AgentEventBus] Handler for "${type}" threw:`, err);
+        }
       }
     }
   }

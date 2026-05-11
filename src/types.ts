@@ -106,6 +106,9 @@ export interface ObotoAgentConfig {
 
   // ── Adaptive iteration control ─────────────────────────────────
 
+  /** Timeout in ms for streaming LLM calls. If the stream doesn't complete within this time, it will be aborted. Default: 120000 (2 minutes) */
+  streamTimeoutMs?: number;
+
   /**
    * Called when the agent reaches maxIterations. Return true to grant
    * more iterations, false to stop. Receives a summary of progress so

@@ -307,6 +307,7 @@ export class ObotoAgent {
         message: err instanceof Error ? err.message : String(err),
         error: err,
       });
+      this.bus.emit("turn_complete", { model: "unknown", escalated: false, error: true });
     } finally {
       this.isProcessing = false;
     }
@@ -681,7 +682,10 @@ export class ObotoAgent {
     const triageResult = await this.triage(userInput);
     this.bus.emit("triage_result", triageResult);
 
-    if (this.interrupted) return;
+    if (this.interrupted) {
+      this.bus.emit("turn_complete", { model: "local", escalated: false, interrupted: true });
+      return;
+    }
 
     // 3. If local can handle directly, emit and return
     if (!triageResult.escalate && triageResult.directResponse) {
@@ -1045,7 +1049,19 @@ export class ObotoAgent {
 
         let response: StandardChatResponse;
         try {
-          response = await this.streamAndAggregate(provider, params);
+          const streamTimeoutMs = this.config.streamTimeoutMs ?? 120_000;
+          let timeoutId: ReturnType<typeof setTimeout>;
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            timeoutId = setTimeout(() => reject(new Error(`Stream timed out after ${streamTimeoutMs}ms`)), streamTimeoutMs);
+          });
+          try {
+            response = await Promise.race([
+              this.streamAndAggregate(provider, params),
+              timeoutPromise,
+            ]);
+          } finally {
+            clearTimeout(timeoutId!);
+          }
         } catch (err) {
           this.emitPhase("error", `LLM call failed: ${err instanceof Error ? err.message : String(err)}`);
           await this.middleware.runError(
@@ -1081,8 +1097,22 @@ export class ObotoAgent {
         }
 
         const choice = response?.choices?.[0];
+        const finishReason = choice?.finish_reason;
         const content = (choice?.message?.content as string) ?? "";
         let toolCalls = choice?.message?.tool_calls;
+
+        // Handle truncated responses — inject continuation prompt and retry
+        if (finishReason === "length" && (!toolCalls || toolCalls.length === 0) && iteration < effectiveMaxIterations) {
+          if (content) {
+            messages.push({ role: "assistant", content });
+            messages.push({ role: "user", content: "Your response was truncated due to length limits. Please continue where you left off." });
+          }
+          this.bus.emit("agent_thought", {
+            text: "[Response truncated — requesting continuation]",
+            model: "system",
+          });
+          continue;
+        }
 
         // Fallback: if the model emitted tool calls as text instead of using
         // native function calling, parse them out and synthesize tool_calls.

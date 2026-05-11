@@ -314,7 +314,7 @@ export class ConversationRAG {
     let chunkIdx = 0;
 
     while (remaining.length > 0) {
-      let splitAt = maxSize;
+      let splitAt = Math.max(maxSize, 1);
 
       if (remaining.length > maxSize) {
         // Try to split at paragraph boundary

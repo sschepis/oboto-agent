@@ -93,4 +93,20 @@ describe("AgentEventBus", () => {
     const bus = new AgentEventBus();
     expect(() => bus.emit("interruption", {})).not.toThrow();
   });
+
+  it("continues calling remaining handlers when one throws", () => {
+    const bus = new AgentEventBus();
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const handler1 = vi.fn(() => { throw new Error("boom"); });
+    const handler2 = vi.fn();
+
+    bus.on("error", handler1);
+    bus.on("error", handler2);
+    bus.emit("error", { message: "test" });
+
+    expect(handler1).toHaveBeenCalledOnce();
+    expect(handler2).toHaveBeenCalledOnce();
+    expect(consoleError).toHaveBeenCalled();
+    consoleError.mockRestore();
+  });
 });
