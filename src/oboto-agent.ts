@@ -14,10 +14,8 @@ import {
   type ModelPricing,
 } from "@sschepis/lmscript";
 import type {
-  StandardChatChunk,
   StandardChatResponse,
 } from "@sschepis/llm-wrapper";
-import { aggregateStream } from "@sschepis/llm-wrapper";
 import type { Session, ConversationMessage } from "@sschepis/as-agent";
 import { MessageRole } from "@sschepis/as-agent";
 import type {
@@ -906,12 +904,18 @@ export class ObotoAgent {
    * - Budget checking (checkBudget before each call)
    * - Middleware lifecycle hooks (onBeforeExecute/onComplete per turn)
    */
+  private zodToJsonSchema?: typeof import("zod-to-json-schema").zodToJsonSchema;
+
   private async executeWithStreaming(
     _runtime: LScriptRuntime,
     modelName: string,
     _userInput: string
   ): Promise<void> {
-    const { zodToJsonSchema } = await import("zod-to-json-schema");
+    if (!this.zodToJsonSchema) {
+      const mod = await import("zod-to-json-schema");
+      this.zodToJsonSchema = mod.zodToJsonSchema;
+    }
+    const zodToJsonSchema = this.zodToJsonSchema;
 
     const provider = modelName === this.config.remoteModelName
       ? this.remoteProvider
@@ -951,8 +955,8 @@ export class ObotoAgent {
     const initialContextLength = messages.length;
     let totalToolCalls = 0;
     const callHistory: string[] = [];
+    const callFrequency = new Map<string, number>();
     const toolsUsedSet = new Set<string>();
-    // Track consecutive duplicate patterns for doom loop detection
     const consecutiveDupes = new Map<string, number>();
     let doomLoopRedirected = false;
     let consecutiveEmpties = 0;
@@ -977,8 +981,8 @@ export class ObotoAgent {
         }
 
         // Prune old tool results to save tokens on subsequent iterations
-        if (iteration > 3) {
-          this.pruneIntraTurnMessages(messages, initialContextLength, 3);
+        if (iteration > 2) {
+          this.pruneIntraTurnMessages(messages, initialContextLength, 2);
         }
 
         // ── Phase: Thinking with iteration context ──
@@ -1039,7 +1043,7 @@ export class ObotoAgent {
 
         const params: import("@sschepis/llm-wrapper").StandardChatParams = {
           model: modelName,
-          messages: [...messages],
+          messages,
           // temperature omitted — some providers (e.g. Anthropic Claude 4.x) reject it
           max_tokens: this.maxOutputTokens,
           ...(isLastIteration
@@ -1191,9 +1195,12 @@ export class ObotoAgent {
         if (content) {
           toolBlocks.push({ kind: "text", text: content });
         }
-        for (const tc of toolCalls) {
+        const parsedArgsCache = new Map<number, Record<string, unknown>>();
+        for (let i = 0; i < toolCalls.length; i++) {
+          const tc = toolCalls[i];
           let parsedTcArgs: Record<string, unknown> = {};
           try { parsedTcArgs = JSON.parse(tc.function.arguments); } catch {}
+          parsedArgsCache.set(i, parsedTcArgs);
           const tcCommand = (parsedTcArgs.command as string) ?? tc.function.name;
           toolBlocks.push({
             kind: "tool_use",
@@ -1214,12 +1221,7 @@ export class ObotoAgent {
           const tc = toolCalls[ti];
           if (this.interrupted) break;
 
-          let args: Record<string, unknown>;
-          try {
-            args = JSON.parse(tc.function.arguments);
-          } catch {
-            args = {};
-          }
+          const args = parsedArgsCache.get(ti) ?? {};
 
           // Validate through Zod schema (same as AgentLoop path), with normalization fallback
           let validatedArgs: Record<string, unknown>;
@@ -1267,7 +1269,8 @@ export class ObotoAgent {
 
           // ── Duplicate detection + doom loop ──
           const callSig = JSON.stringify({ command, kwargs });
-          const dupeCount = callHistory.filter((s) => s === callSig).length;
+          const dupeCount = callFrequency.get(callSig) ?? 0;
+          callFrequency.set(callSig, dupeCount + 1);
           callHistory.push(callSig);
 
           // Track consecutive dupes for doom loop detection
@@ -1308,11 +1311,11 @@ export class ObotoAgent {
               totalToolCalls++;
 
               // Backfill tool_results for remaining unanswered tool_calls
-              const answeredIds = new Set(
-                messages
-                  .filter((m: any) => m.role === "tool" && m.tool_call_id)
-                  .map((m: any) => m.tool_call_id),
-              );
+              const answeredIds = new Set<string>();
+              for (let ai = initialContextLength; ai < messages.length; ai++) {
+                const m = messages[ai] as any;
+                if (m.role === "tool" && m.tool_call_id) answeredIds.add(m.tool_call_id);
+              }
               for (const remainingTc of toolCalls!) {
                 if (!answeredIds.has(remainingTc.id)) {
                   messages.push({
@@ -1379,12 +1382,14 @@ export class ObotoAgent {
 
           let result: string;
           let isError = false;
+          const toolStartTime = Date.now();
           try {
             result = await tool.execute(validatedArgs);
           } catch (err) {
             result = `Error: ${err instanceof Error ? err.message : String(err)}`;
             isError = true;
           }
+          const durationMs = Date.now() - toolStartTime;
 
           const resultStr = typeof result === "string" ? result : JSON.stringify(result);
           const truncated =
@@ -1397,7 +1402,7 @@ export class ObotoAgent {
             this.hookIntegration.runPostToolUse(command, toolInputStr, truncated, isError);
           }
 
-          this.bus.emit("tool_execution_complete", { command, kwargs, result: truncated, error: isError ? truncated : undefined });
+          this.bus.emit("tool_execution_complete", { command, kwargs, result: truncated, error: isError ? truncated : undefined, durationMs });
           this.recordToolResult(command, kwargs, truncated);
           roundTools.push({ command, success: !isError, kwargs });
           totalToolCalls++;
@@ -1427,11 +1432,11 @@ export class ObotoAgent {
         // to interruption or early exit).  The API requires every tool_use to
         // have a matching tool_result in the immediately following message.
         if (toolCalls) {
-          const answeredIds = new Set(
-            messages
-              .filter((m: any) => m.role === "tool" && m.tool_call_id)
-              .map((m: any) => m.tool_call_id),
-          );
+          const answeredIds = new Set<string>();
+          for (let ai = initialContextLength; ai < messages.length; ai++) {
+            const m = messages[ai] as any;
+            if (m.role === "tool" && m.tool_call_id) answeredIds.add(m.tool_call_id);
+          }
           for (const tc of toolCalls) {
             if (!answeredIds.has(tc.id)) {
               messages.push({
@@ -1552,23 +1557,69 @@ export class ObotoAgent {
   ): Promise<StandardChatResponse> {
     const stream = provider.stream({ ...params, stream: true });
 
-    const chunks: StandardChatChunk[] = [];
+    let aggId = "", aggModel = "", aggCreated = 0;
+    let aggContent = "", aggFinishReason: string | null = null;
+    const aggToolCalls = new Map<number, { id: string; name: string; arguments: string }>();
+    let aggUsage: StandardChatResponse["usage"] = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+
     for await (const chunk of stream) {
       if (this.interrupted) {
         throw new Error("Generation interrupted by user");
       }
-      chunks.push(chunk);
+      if (!aggId && chunk.id) aggId = chunk.id;
+      if (!aggModel && chunk.model) aggModel = chunk.model;
+      if (!aggCreated && chunk.created) aggCreated = chunk.created;
 
-      const delta = chunk.choices?.[0]?.delta;
+      const choice = chunk.choices?.[0];
+      const delta = choice?.delta;
       if (delta?.content) {
+        aggContent += delta.content;
         this.onToken!(delta.content);
         this.bus.emit("token", { text: delta.content });
       }
+      if (choice?.finish_reason) aggFinishReason = choice.finish_reason;
+      if (delta?.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          const existing = aggToolCalls.get(tc.index);
+          if (existing) {
+            if (tc.function?.name) existing.name = tc.function.name;
+            if (tc.function?.arguments) existing.arguments += tc.function.arguments;
+            if (tc.id) existing.id = tc.id;
+          } else {
+            aggToolCalls.set(tc.index, {
+              id: tc.id ?? "",
+              name: tc.function?.name ?? "",
+              arguments: tc.function?.arguments ?? "",
+            });
+          }
+        }
+      }
+      if (chunk.usage) aggUsage = chunk.usage;
     }
 
-    async function* replay(): AsyncIterable<StandardChatChunk> {
-      for (const c of chunks) yield c;
-    }
-    return aggregateStream(replay());
+    const toolCallsArr = [...aggToolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, tc]) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: tc.arguments },
+      }));
+
+    return {
+      id: aggId,
+      object: "chat.completion",
+      created: aggCreated,
+      model: aggModel,
+      choices: [{
+        index: 0,
+        message: {
+          role: "assistant",
+          content: aggContent || null,
+          ...(toolCallsArr.length > 0 ? { tool_calls: toolCallsArr } : {}),
+        },
+        finish_reason: aggFinishReason,
+      }],
+      usage: aggUsage,
+    } as StandardChatResponse;
   }
 }
